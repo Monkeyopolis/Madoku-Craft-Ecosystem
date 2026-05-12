@@ -1,0 +1,32 @@
+{
+	"schemaVersion": 1,
+	"id": "madoku-craft-ecosystem",
+	"version": "${version}",
+	"name": "Madoku Craft: Ecosystem",
+	"description": "A configurable Ecosystem MOD for Minecraft.",
+	"authors": [
+		"Monkeyopolis"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/madoku-craft-ecosystem/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"madoku.craft.ecosystem.MadokuCraftEcosystem"
+		]
+	},
+	"mixins": [
+		"madoku-craft-ecosystem.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.2",
+		"minecraft": "~26.1.2",
+		"java": ">=25",
+		"fabric-api": "*",
+		"madoku-craft-api": ">=${madoku_craft_api_mod_version}"
+	}
+}
