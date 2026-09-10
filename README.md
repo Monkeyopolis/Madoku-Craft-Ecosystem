@@ -1,25 +1,29 @@
-## Madoku Craft: Ecosystem
+## Overview:
 
-Madoku Craft: Ecosystem is a configurable system that dynamically changes a World's Environment.
-You can customize most of these features in the CONFIG files.
+Madoku Craft: Ecosystems allows the world to dynamically change overtime.
+Trees, foliage start to naturally grow through time.
+Tree leaves decay, leaving leaf litter below them.
+Shorelines naturally erode into sand.
+These mechanics are configurable in the config files.
 
 ## Dependencies:
 
 - Fabric API
-- Madoku Craft API
+- Madoku Craft: Core
 
 ## Features:
 
-Natural Growth:
+**Natural Erosion:**
 
-- Depending on the Biome and Season, Trees naturally grow around a World.
-- In certain Biomes and Seasons, certain Folliage grow.
+- Certain blocks near water erode into sand.
 
-Natural Erosion:
+**Natural Decay:**
 
-- Depending on the Biome and Season, certain blocks near water erode through time.
-- This naturally transforms those blocks into other ones.
+- Trees leave leaf litter underneath them.
 
-Natural Tree Litter:
+**Natural Growth:**
 
-- After a certain amount of time, Trees displace Leaf-Litter to blocks below them during certain Seasons.
+- Certain biomes grow flowers.
+- Tree grows over certain blocks, the trees that grow depend on the biome.
+- Foliage grow where there is grass.
+- Cactus and dry foliage grow in certain biomes.

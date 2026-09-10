@@ -9,5 +9,8 @@ pluginManagement {
 	}
 }
 
-// Should match your modid
-rootProject.name = 'madoku-craft-ecosystem'
+rootProject.name = "madoku-craft-ecosystem"
+
+if (gradle.parent == null) {
+	includeBuild("../core")
+}
