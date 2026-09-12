@@ -1088,8 +1088,8 @@ public final class EcosystemNaturalGrowthManager {
 		}
 
 		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
-		int chunkX = event.chunk().getPos().x();
-		int chunkZ = event.chunk().getPos().z();
+		int chunkX = event.chunk().getPos().x;
+		int chunkZ = event.chunk().getPos().z;
 		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
 			EcosystemAPIManager.levelId(world), chunkX, chunkZ
 		);

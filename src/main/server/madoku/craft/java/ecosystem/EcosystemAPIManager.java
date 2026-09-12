@@ -306,7 +306,7 @@ final class EcosystemAPIManager {
 		for (ServerLevel level : server.getAllLevels()) {
 			level.getChunkSource().chunkMap.forEachReadyToSendChunk((LevelChunk chunk) -> {
 				if (chunk != null) {
-					loadPersistedChunkData(level, chunk.getPos().x(), chunk.getPos().z());
+					loadPersistedChunkData(level, chunk.getPos().x, chunk.getPos().z);
 				}
 			});
 		}
@@ -1010,12 +1010,12 @@ final class EcosystemAPIManager {
 			return null;
 		}
 
-		ChunkRefKey chunkKey = new ChunkRefKey(levelId(world), chunk.getPos().x(), chunk.getPos().z());
+		ChunkRefKey chunkKey = new ChunkRefKey(levelId(world), chunk.getPos().x, chunk.getPos().z);
 		long currentGameTime = world.getGameTime();
 		Long nextScanTick = NEXT_SURFACE_SCAN_TICKS.get(chunkKey);
 		long scanSeed = 0x9E3779B97F4A7C15L
-			^ ((long) chunk.getPos().x() * 0xBF58476D1CE4E5B9L)
-			^ ((long) chunk.getPos().z() * 0x94D049BB133111EBL)
+			^ ((long) chunk.getPos().x * 0xBF58476D1CE4E5B9L)
+			^ ((long) chunk.getPos().z * 0x94D049BB133111EBL)
 			^ (long) levelId(world).hashCode();
 		long mixedSeed = mixSurfaceScanSeed(scanSeed);
 		if (nextScanTick == null) {

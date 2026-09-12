@@ -263,8 +263,8 @@ public final class EcosystemNaturalDecayManager {
 		}
 
 		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
-		int chunkX = event.chunk().getPos().x();
-		int chunkZ = event.chunk().getPos().z();
+		int chunkX = event.chunk().getPos().x;
+		int chunkZ = event.chunk().getPos().z;
 		processTreeDecayCandidatesInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
 		discoverTreeDecayCandidatesInColumn(world, event.chunk(), event.surfaceGroundPosition());
 	}
@@ -300,8 +300,8 @@ public final class EcosystemNaturalDecayManager {
 
 		int x = surfaceGroundPosition.getX();
 		int z = surfaceGroundPosition.getZ();
-		int chunkX = chunk.getPos().x();
-		int chunkZ = chunk.getPos().z();
+		int chunkX = chunk.getPos().x;
+		int chunkZ = chunk.getPos().z;
 		int topY = Math.min(
 			world.getMaxY() - 1,
 			chunk.getHeight(

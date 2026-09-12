@@ -505,8 +505,8 @@ public final class EcosystemNaturalErosionManager {
 			return false;
 		}
 		LevelChunk chunk = activeChunk != null
-			&& activeChunk.getPos().x() == (fluidPosition.getX() >> 4)
-			&& activeChunk.getPos().z() == (fluidPosition.getZ() >> 4)
+			&& activeChunk.getPos().x == (fluidPosition.getX() >> 4)
+			&& activeChunk.getPos().z == (fluidPosition.getZ() >> 4)
 			? activeChunk
 			: resolveChunk(world, fluidPosition);
 		if (chunk == null) {
