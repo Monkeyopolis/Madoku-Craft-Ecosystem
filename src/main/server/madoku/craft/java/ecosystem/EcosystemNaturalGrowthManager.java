@@ -25,7 +25,7 @@ import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import net.minecraft.tags.TagKey;
 import net.minecraft.data.worldgen.features.TreeFeatures;
-import net.minecraft.world.level.levelgen.feature.ConfiguredFeature;
+import net.minecraft.world.level.levelgen.feature.Feature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -584,7 +584,7 @@ public final class EcosystemNaturalGrowthManager {
 			setBlockAndUpdate(world, treePos, Blocks.AIR.defaultBlockState());
 		}
 
-		ResourceKey<ConfiguredFeature<?, ?>> featureKey = treeFeatureKeyForType(treeType);
+		ResourceKey<Feature> featureKey = treeFeatureKeyForType(treeType);
 		if (featureKey == null) {
 			if (replacedState.is(Blocks.SNOW) && world.getBlockState(treePos).isAir()) {
 				setBlockAndUpdate(world, treePos, replacedState);
@@ -592,8 +592,8 @@ public final class EcosystemNaturalGrowthManager {
 			return false;
 		}
 
-		HolderGetter<ConfiguredFeature<?, ?>> configuredFeatures = world.registryAccess().lookupOrThrow(Registries.CONFIGURED_FEATURE);
-		java.util.Optional<Holder.Reference<ConfiguredFeature<?, ?>>> featureHolder = configuredFeatures.get(featureKey);
+		HolderGetter<Feature> configuredFeatures = world.registryAccess().lookupOrThrow(Registries.FEATURE);
+		java.util.Optional<Holder.Reference<Feature>> featureHolder = configuredFeatures.get(featureKey);
 		if (featureHolder.isEmpty()) {
 			if (replacedState.is(Blocks.SNOW) && world.getBlockState(treePos).isAir()) {
 				setBlockAndUpdate(world, treePos, replacedState);
@@ -930,7 +930,7 @@ public final class EcosystemNaturalGrowthManager {
 		return tryPlaceWeightedFoliageTarget(world, growPos, buildDesertFoliagePlacements());
 	}
 
-	private static ResourceKey<ConfiguredFeature<?, ?>> treeFeatureKeyForType(String treeType) {
+	private static ResourceKey<Feature> treeFeatureKeyForType(String treeType) {
 		if (TREE_TYPE_BIRCH.equals(treeType)) {
 			return TreeFeatures.BIRCH;
 		}
