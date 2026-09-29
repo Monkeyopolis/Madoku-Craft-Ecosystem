@@ -129,21 +129,23 @@ final class EcosystemAPIManager {
 	private static final Set<ChunkRefKey> LOADED_PERSISTED_CHUNK_KEYS = new LinkedHashSet<>();
 	private static final Set<ChunkRefKey> DIRTY_CHUNK_KEYS = new LinkedHashSet<>();
 	private static final long SURFACE_SCAN_INTERVAL_TICKS = 10L;
-	private static final Map<ChunkRefKey, Integer> SURFACE_SCAN_CURSORS = new LinkedHashMap<>();
-	private static final Map<ChunkRefKey, Long> NEXT_SURFACE_SCAN_TICKS = new LinkedHashMap<>();
+	private static final Map<ChunkRefKey, SurfaceScanState> SURFACE_SCAN_STATES = new LinkedHashMap<>();
 	static final Map<String, DirtState> dirtBlocksByKey = new LinkedHashMap<>();
 	private static final Map<String, Map<Long, DirtState>> dirtStatesByLevelAndPosition = new LinkedHashMap<>();
 	static final Map<ChunkRefKey, Set<String>> dirtKeysByChunk = new LinkedHashMap<>();
 	static final Map<ColumnRefKey, Set<String>> dirtKeysByColumn = new LinkedHashMap<>();
 	private static final Map<CandidatePositionKey, Integer> CANDIDATE_POSITION_MASKS = new LinkedHashMap<>();
 	private static final Map<ChunkRefKey, Set<CandidatePositionKey>> CANDIDATE_POSITION_KEYS_BY_CHUNK = new LinkedHashMap<>();
+	// A position has one owner only. Surface discovery order is the priority:
+	// dirt/erosion, tree, cactus, grass, desert foliage, foliage, then decay.
 	static final int CANDIDATE_DIRT = 1;
 	static final int CANDIDATE_TREE = 1 << 1;
 	static final int CANDIDATE_CACTUS = 1 << 2;
 	static final int CANDIDATE_GRASS = 1 << 3;
-	static final int CANDIDATE_FOLIAGE = 1 << 4;
-	static final int CANDIDATE_DECAY = 1 << 5;
+	static final int CANDIDATE_DECAY = 1 << 4;
+	static final int CANDIDATE_FOLIAGE = 1 << 5;
 	static final int CANDIDATE_WET = 1 << 6;
+	static final int CANDIDATE_DESERT_FOLIAGE = 1 << 7;
 
 	private static final ChunkAPIManager.ChunkLifecycleListener CHUNK_LISTENER = new ChunkAPIManager.ChunkLifecycleListener() {
 		@Override
@@ -200,8 +202,7 @@ final class EcosystemAPIManager {
 		cachedAbsoluteTimeLevelId = "";
 		cachedAbsoluteTimeGameTime = Long.MIN_VALUE;
 		cachedAbsoluteDayTime = Long.MIN_VALUE;
-		SURFACE_SCAN_CURSORS.clear();
-		NEXT_SURFACE_SCAN_TICKS.clear();
+		SURFACE_SCAN_STATES.clear();
 	}
 
 	public static void onServerTick(MinecraftServer server) {
@@ -472,7 +473,7 @@ final class EcosystemAPIManager {
 		}
 		double startingProgress = existing != null && mode.equals(existing.mode) ? existing.progressGrowthTicks : 0.0d;
 
-		putDirtState(key, new DirtState(
+		if (!putDirtState(key, new DirtState(
 			levelId(world),
 			dirtPos.asLong(),
 			mode,
@@ -480,7 +481,9 @@ final class EcosystemAPIManager {
 			requiredGrowthTicks,
 			Math.max(0.0d, Math.min(requiredGrowthTicks, startingProgress)),
 			resolveAbsoluteDayTime(world)
-		));
+		))) {
+			return false;
+		}
 		dirty = true;
 		return true;
 	}
@@ -504,7 +507,7 @@ final class EcosystemAPIManager {
 		if (requiredGrowthTicks <= 0.0d) {
 			return false;
 		}
-		putDirtState(key, new DirtState(
+		if (!putDirtState(key, new DirtState(
 			levelId(world),
 			dirtPos.asLong(),
 			MODE_WET,
@@ -512,7 +515,9 @@ final class EcosystemAPIManager {
 			requiredGrowthTicks,
 			existing != null && MODE_WET.equals(existing.mode) ? existing.progressGrowthTicks : 0.0d,
 			resolveAbsoluteDayTime(world)
-		));
+		))) {
+			return false;
+		}
 		dirty = true;
 		return true;
 	}
@@ -584,22 +589,49 @@ final class EcosystemAPIManager {
 		return EcosystemNaturalErosionManager.isLavaMagmaSourceBlockId(blockId);
 	}
 
-	private static DirtState putDirtState(String key, DirtState value) {
-		DirtState previous = dirtBlocksByKey.put(key, value);
+	private static boolean putDirtState(String key, DirtState value) {
+		if (key == null || value == null) {
+			return false;
+		}
+		DirtState previous = dirtBlocksByKey.get(key);
+		int previousBit = previous == null ? 0 : dirtCandidateBit(previous.mode);
+		int nextBit = dirtCandidateBit(value.mode);
+		int currentMask = CANDIDATE_POSITION_MASKS.getOrDefault(
+			new CandidatePositionKey(value.levelId, value.dirtPos),
+			0
+		);
+		if (currentMask != 0 && currentMask != nextBit && currentMask != previousBit) {
+			return false;
+		}
+
 		ChunkRefKey previousChunkKey = null;
 		if (previous != null) {
+			dirtBlocksByKey.remove(key);
 			removeDirtPositionIndex(previous);
 			previousChunkKey = chunkRefForPos(previous.levelId, previous.dirtPos);
-			removeCandidatePositionBit(previous.levelId, previous.dirtPos, MODE_WET.equals(previous.mode) ? CANDIDATE_WET : CANDIDATE_DIRT);
+			removeCandidatePositionBit(previous.levelId, previous.dirtPos, previousBit);
 			removeChunkIndex(dirtKeysByChunk, previousChunkKey, key);
 			removeColumnIndex(previous, key);
 			markChunkDirty(previousChunkKey);
 		}
+		if (!addCandidatePositionBit(value.levelId, value.dirtPos, nextBit)) {
+			if (previous != null) {
+				// The preflight above should make this unreachable, but preserve the
+				// existing candidate if another registration raced this update.
+				dirtBlocksByKey.put(key, previous);
+				putDirtPositionIndex(previous);
+				ChunkRefKey restoreChunkKey = chunkRefForPos(previous.levelId, previous.dirtPos);
+				addChunkIndex(dirtKeysByChunk, restoreChunkKey, key);
+				addColumnIndex(previous, key);
+				addCandidatePositionBit(previous.levelId, previous.dirtPos, previousBit);
+			}
+			return false;
+		}
+		dirtBlocksByKey.put(key, value);
 		ChunkRefKey nextChunkKey = null;
 		if (value != null) {
 			putDirtPositionIndex(value);
 			nextChunkKey = chunkRefForPos(value.levelId, value.dirtPos);
-			addCandidatePositionBit(value.levelId, value.dirtPos, MODE_WET.equals(value.mode) ? CANDIDATE_WET : CANDIDATE_DIRT);
 			addChunkIndex(dirtKeysByChunk, nextChunkKey, key);
 			addColumnIndex(value, key);
 			markChunkDirty(nextChunkKey);
@@ -612,7 +644,11 @@ final class EcosystemAPIManager {
 				value.requiredGrowthTicks
 			);
 		}
-		return previous;
+		return true;
+	}
+
+	private static int dirtCandidateBit(String mode) {
+		return MODE_WET.equals(mode) ? CANDIDATE_WET : CANDIDATE_DIRT;
 	}
 
 	static DirtState removeDirtStateByKey(String key) {
@@ -620,10 +656,11 @@ final class EcosystemAPIManager {
 		if (removed != null) {
 			removeDirtPositionIndex(removed);
 			ChunkRefKey chunkKey = chunkRefForPos(removed.levelId, removed.dirtPos);
-			removeCandidatePositionBit(removed.levelId, removed.dirtPos, MODE_WET.equals(removed.mode) ? CANDIDATE_WET : CANDIDATE_DIRT);
+			removeCandidatePositionBit(removed.levelId, removed.dirtPos, dirtCandidateBit(removed.mode));
 			removeChunkIndex(dirtKeysByChunk, chunkKey, key);
 			removeColumnIndex(removed, key);
 			markChunkDirty(chunkKey);
+			EcosystemNaturalGrowthManager.refreshCandidateSchedule(chunkKey);
 		}
 		return removed;
 	}
@@ -740,7 +777,8 @@ final class EcosystemAPIManager {
 		int growthCandidateMask = CANDIDATE_TREE
 			| CANDIDATE_CACTUS
 			| CANDIDATE_GRASS
-			| CANDIDATE_FOLIAGE;
+			| CANDIDATE_FOLIAGE
+			| CANDIDATE_DESERT_FOLIAGE;
 		if ((candidateMask & growthCandidateMask) != 0) {
 			EcosystemNaturalGrowthManager.removeCandidatesAt(chunkKey, packedPosition);
 		}
@@ -749,24 +787,41 @@ final class EcosystemAPIManager {
 		}
 	}
 
-	private static void addCandidatePositionMask(String levelId, long position, int bit) {
+	private static boolean addCandidatePositionMask(String levelId, long position, int bit) {
 		if (levelId == null || levelId.isBlank() || position == Long.MIN_VALUE) {
-			return;
+			return false;
 		}
 		CandidatePositionKey key = new CandidatePositionKey(levelId, position);
 		int currentMask = CANDIDATE_POSITION_MASKS.getOrDefault(key, 0);
-		int nextMask = currentMask | bit;
-		if (nextMask == currentMask) {
-			return;
+		if (currentMask != 0 && currentMask != bit) {
+			return false;
 		}
-		CANDIDATE_POSITION_MASKS.put(key, nextMask);
+		if (currentMask == bit) {
+			return true;
+		}
+		CANDIDATE_POSITION_MASKS.put(key, bit);
 		CANDIDATE_POSITION_KEYS_BY_CHUNK
 			.computeIfAbsent(chunkRefForPos(levelId, position), ignored -> new LinkedHashSet<>())
 			.add(key);
+		return true;
 	}
 
-	static void addCandidatePositionBit(String levelId, long position, int bit) {
-		addCandidatePositionMask(levelId, position, bit);
+	static boolean addCandidatePositionBit(String levelId, long position, int bit) {
+		return addCandidatePositionMask(levelId, position, bit);
+	}
+
+	static boolean canClaimCandidatePosition(String levelId, long position, int bit) {
+		if (levelId == null || levelId.isBlank() || position == Long.MIN_VALUE) {
+			return false;
+		}
+		int currentMask = CANDIDATE_POSITION_MASKS.getOrDefault(
+			new CandidatePositionKey(levelId, position),
+			0
+		);
+		if (currentMask != 0 && currentMask != bit) {
+			return false;
+		}
+		return true;
 	}
 
 	static void removeCandidatePositionBit(String levelId, long position, int bit) {
@@ -806,6 +861,7 @@ final class EcosystemAPIManager {
 			return;
 		}
 
+		EcosystemNaturalDecayManager.materializeCandidateProgressForSave(level, chunkKey);
 		JsonObject chunkData = createChunkPersistedData(chunkKey);
 		WorldChunkDataKey dataKey = new WorldChunkDataKey(
 			chunkKey.levelId(),
@@ -830,8 +886,7 @@ final class EcosystemAPIManager {
 		if (chunkKey == null) {
 			return;
 		}
-		SURFACE_SCAN_CURSORS.remove(chunkKey);
-		NEXT_SURFACE_SCAN_TICKS.remove(chunkKey);
+		SURFACE_SCAN_STATES.remove(chunkKey);
 
 		Set<String> dirtKeys = dirtKeysByChunk.remove(chunkKey);
 		if (dirtKeys != null) {
@@ -894,6 +949,25 @@ final class EcosystemAPIManager {
 			safeCurrent,
 			deriveCandidateStartTime(safeCurrent, nextProgress)
 		);
+	}
+
+	static boolean isCandidateDue(
+		double trackedProgress,
+		long lastProcessedAbsoluteDayTime,
+		long currentAbsoluteDayTime,
+		double requiredTicks
+	) {
+		double safeRequired = Math.max(1.0d, requiredTicks);
+		double safeProgress = Double.isFinite(trackedProgress)
+			? Math.max(0.0d, Math.min(safeRequired, trackedProgress))
+			: 0.0d;
+		long safeLast = Math.max(0L, lastProcessedAbsoluteDayTime);
+		long safeCurrent = Math.max(0L, currentAbsoluteDayTime);
+		if (safeCurrent < safeLast) {
+			return true;
+		}
+		double dueTime = safeLast + Math.max(0.0d, safeRequired - safeProgress);
+		return safeCurrent >= dueTime;
 	}
 
 	static double resolveCandidateProgress(long startedAbsoluteDayTime, long currentAbsoluteDayTime, double requiredTicks) {
@@ -962,12 +1036,18 @@ final class EcosystemAPIManager {
 		if (world == null) {
 			return TimeAPIManager.getCurrentAbsoluteDayTime();
 		}
-		String currentLevelId = levelId(world);
-		long currentGameTime = world.getGameTime();
-		if (currentGameTime == cachedAbsoluteTimeGameTime && currentLevelId.equals(cachedAbsoluteTimeLevelId)) {
+		return resolveCachedAbsoluteDayTime(world, levelId(world), world.getGameTime());
+	}
+
+	static long resolveCachedAbsoluteDayTime(ServerLevel world, String currentLevelId, long currentGameTime) {
+		if (world == null) {
+			return TimeAPIManager.getCurrentAbsoluteDayTime();
+		}
+		String safeLevelId = currentLevelId == null ? levelId(world) : currentLevelId;
+		if (currentGameTime == cachedAbsoluteTimeGameTime && safeLevelId.equals(cachedAbsoluteTimeLevelId)) {
 			return cachedAbsoluteDayTime;
 		}
-		cachedAbsoluteTimeLevelId = currentLevelId;
+		cachedAbsoluteTimeLevelId = safeLevelId;
 		cachedAbsoluteTimeGameTime = currentGameTime;
 		cachedAbsoluteDayTime = TimeAPIManager.getCurrentAbsoluteDayTime(world);
 		return cachedAbsoluteDayTime;
@@ -1005,39 +1085,68 @@ final class EcosystemAPIManager {
 		return groundPosition;
 	}
 
-	static BlockPos nextSurfaceGroundPosition(ServerLevel world, LevelChunk chunk) {
-		if (world == null || chunk == null) {
+	static BlockPos nextSurfaceGroundPosition(
+		ServerLevel world,
+		LevelChunk chunk,
+		ChunkRefKey chunkKey,
+		long currentGameTime,
+		boolean candidateWork
+	) {
+		if (world == null || chunk == null || chunkKey == null) {
 			return null;
 		}
 
-		ChunkRefKey chunkKey = new ChunkRefKey(levelId(world), chunk.getPos().x(), chunk.getPos().z());
-		long currentGameTime = world.getGameTime();
-		Long nextScanTick = NEXT_SURFACE_SCAN_TICKS.get(chunkKey);
-		long scanSeed = 0x9E3779B97F4A7C15L
-			^ ((long) chunk.getPos().x() * 0xBF58476D1CE4E5B9L)
-			^ ((long) chunk.getPos().z() * 0x94D049BB133111EBL)
-			^ (long) levelId(world).hashCode();
-		long mixedSeed = mixSurfaceScanSeed(scanSeed);
-		if (nextScanTick == null) {
-			int initialDelay = Math.floorMod((int) (mixedSeed >>> 16), (int) SURFACE_SCAN_INTERVAL_TICKS);
+		SurfaceScanState state = SURFACE_SCAN_STATES.computeIfAbsent(chunkKey, EcosystemAPIManager::createSurfaceScanState);
+		if (state.nextScanTick == Long.MIN_VALUE) {
+			int initialDelay = Math.floorMod((int) (state.mixedSeed >>> 16), (int) SURFACE_SCAN_INTERVAL_TICKS);
 			if (initialDelay > 0) {
-				NEXT_SURFACE_SCAN_TICKS.put(chunkKey, currentGameTime + initialDelay);
+				state.nextScanTick = currentGameTime + initialDelay;
 				return null;
 			}
-		} else if (currentGameTime < nextScanTick) {
+			state.nextScanTick = currentGameTime;
+		}
+		if (currentGameTime < state.nextScanTick) {
+			return null;
+		}
+		if (candidateWork && state.candidateDeferrals < 1) {
+			state.candidateDeferrals++;
+			state.nextScanTick = currentGameTime + 1L;
 			return null;
 		}
 
-		int cursor = SURFACE_SCAN_CURSORS.getOrDefault(chunkKey, 0);
-		int scanStart = (int) mixedSeed & 255;
-		int scanStep = (((int) (mixedSeed >>> 8)) & 255) | 1;
-		int localIndex = (scanStart + cursor * scanStep) & 255;
+		int localIndex = (state.scanStart + state.cursor * state.scanStep) & 255;
 		int localX = localIndex & 15;
 		int localZ = (localIndex >>> 4) & 15;
-		SURFACE_SCAN_CURSORS.put(chunkKey, (cursor + 1) & 255);
-		NEXT_SURFACE_SCAN_TICKS.put(chunkKey, currentGameTime + SURFACE_SCAN_INTERVAL_TICKS);
+		state.cursor = (state.cursor + 1) & 255;
+		state.nextScanTick = currentGameTime + SURFACE_SCAN_INTERVAL_TICKS;
+		state.candidateDeferrals = 0;
 		BlockPos probe = new BlockPos(chunk.getPos().getMinBlockX() + localX, world.getMinY(), chunk.getPos().getMinBlockZ() + localZ);
-		return resolveCachedGroundPosition(world, chunk, probe);
+		BlockPos groundPosition = resolveCachedGroundPosition(world, chunk, probe);
+		return groundPosition;
+	}
+
+	private static SurfaceScanState createSurfaceScanState(ChunkRefKey chunkKey) {
+		long scanSeed = 0x9E3779B97F4A7C15L
+			^ ((long) chunkKey.chunkX() * 0xBF58476D1CE4E5B9L)
+			^ ((long) chunkKey.chunkZ() * 0x94D049BB133111EBL)
+			^ (long) chunkKey.levelId().hashCode();
+		long mixedSeed = mixSurfaceScanSeed(scanSeed);
+		return new SurfaceScanState(mixedSeed, (int) mixedSeed & 255, (((int) (mixedSeed >>> 8)) & 255) | 1);
+	}
+
+	private static final class SurfaceScanState {
+		private final long mixedSeed;
+		private final int scanStart;
+		private final int scanStep;
+		private int cursor;
+		private long nextScanTick = Long.MIN_VALUE;
+		private int candidateDeferrals;
+
+		private SurfaceScanState(long mixedSeed, int scanStart, int scanStep) {
+			this.mixedSeed = mixedSeed;
+			this.scanStart = scanStart;
+			this.scanStep = scanStep;
+		}
 	}
 
 	private static long mixSurfaceScanSeed(long value) {
@@ -1213,6 +1322,7 @@ final class EcosystemAPIManager {
 		}
 		for (ServerLevel level : server.getAllLevels()) {
 			EcosystemNaturalGrowthManager.materializeCandidateProgressForSave(level);
+			EcosystemNaturalDecayManager.materializeCandidateProgressForSave(level);
 		}
 	}
 

@@ -27,7 +27,7 @@ public final class NaturalDecayConfigManager {
 			new LeafLitterSettings(
 				true,
 				new EcosystemConfigManager.DayRange(5, 7),
-				new EcosystemConfigManager.SeasonGrowthMultiplier(1.0d, 0.0d, 3.0d, 0.0d)
+				new EcosystemConfigManager.SeasonGrowthMultiplier(1.0d, 0.25d, 2.5d, 0.25d)
 			)
 		);
 	}

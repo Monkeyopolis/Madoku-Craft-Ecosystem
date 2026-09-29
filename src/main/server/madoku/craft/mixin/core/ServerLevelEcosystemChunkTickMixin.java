@@ -13,6 +13,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class ServerLevelEcosystemChunkTickMixin {
 	@Inject(method = "tickChunk", at = @At("TAIL"))
 	private void madokuCraft$dispatchChunkTick(LevelChunk chunk, int randomTickSpeed, CallbackInfo ci) {
-		EcosystemChunkTickAPIManager.dispatch((ServerLevel) (Object) this, chunk);
+		EcosystemChunkTickAPIManager.dispatch((ServerLevel) (Object) this, chunk, randomTickSpeed);
 	}
 }

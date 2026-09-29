@@ -21,11 +21,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -39,6 +39,10 @@ public final class EcosystemNaturalDecayManager {
 	private static final Predicate<BlockState> LEAF_BLOCK_STATE = state -> state != null && state.is(BlockTags.LEAVES);
 	static final Map<EcosystemAPIManager.ChunkRefKey, Map<Long, EcosystemAPIManager.TreeDecayCandidateState>> treeDecayCandidatesByChunk = new LinkedHashMap<>();
 	private static final Map<EcosystemAPIManager.ChunkRefKey, Map<Long, Long>> treeDecayTargetOwnersByChunk = new LinkedHashMap<>();
+	private static final Map<EcosystemAPIManager.ChunkRefKey, Double> NEXT_CANDIDATE_DUE_BY_CHUNK = new LinkedHashMap<>();
+	private static final Map<EcosystemAPIManager.ChunkRefKey, Long> MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK = new LinkedHashMap<>();
+	private static final Map<EcosystemAPIManager.ChunkRefKey, PriorityQueue<CandidateDueEntry>> CANDIDATE_DUE_QUEUES = new LinkedHashMap<>();
+	private static final Map<EcosystemAPIManager.ChunkRefKey, Map<Long, Long>> CANDIDATE_DUE_VERSIONS = new LinkedHashMap<>();
 
 	private EcosystemNaturalDecayManager() {
 	}
@@ -54,6 +58,10 @@ public final class EcosystemNaturalDecayManager {
 	static void clearTrackedCandidateState() {
 		treeDecayCandidatesByChunk.clear();
 		treeDecayTargetOwnersByChunk.clear();
+		NEXT_CANDIDATE_DUE_BY_CHUNK.clear();
+		MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.clear();
+		CANDIDATE_DUE_QUEUES.clear();
+		CANDIDATE_DUE_VERSIONS.clear();
 	}
 
 	static void evictTrackedCandidateState(EcosystemAPIManager.ChunkRefKey chunkKey) {
@@ -62,6 +70,10 @@ public final class EcosystemNaturalDecayManager {
 		}
 		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.remove(chunkKey);
 		treeDecayTargetOwnersByChunk.remove(chunkKey);
+		NEXT_CANDIDATE_DUE_BY_CHUNK.remove(chunkKey);
+		MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.remove(chunkKey);
+		CANDIDATE_DUE_QUEUES.remove(chunkKey);
+		CANDIDATE_DUE_VERSIONS.remove(chunkKey);
 		if (candidates != null) {
 			for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
 				if (candidate != null) {
@@ -75,6 +87,78 @@ public final class EcosystemNaturalDecayManager {
 		return new java.util.LinkedHashSet<>(treeDecayCandidatesByChunk.keySet());
 	}
 
+	/** Materializes lazy decay progress before autosave or chunk eviction. */
+	static void materializeCandidateProgressForSave(ServerLevel world) {
+		if (world == null) {
+			return;
+		}
+		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
+		String currentLevelId = EcosystemAPIManager.levelId(world);
+		for (EcosystemAPIManager.ChunkRefKey chunkKey : new java.util.LinkedHashSet<>(treeDecayCandidatesByChunk.keySet())) {
+			if (chunkKey == null || !currentLevelId.equals(chunkKey.levelId())) {
+				continue;
+			}
+			materializeCandidateProgressForSave(world, chunkKey, currentAbsoluteDayTime);
+		}
+	}
+
+	static void materializeCandidateProgressForSave(
+		ServerLevel world,
+		EcosystemAPIManager.ChunkRefKey chunkKey
+	) {
+		if (world == null || chunkKey == null) {
+			return;
+		}
+		materializeCandidateProgressForSave(
+			world,
+			chunkKey,
+			EcosystemAPIManager.resolveCachedAbsoluteDayTime(world)
+		);
+	}
+
+	private static void materializeCandidateProgressForSave(
+		ServerLevel world,
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		long currentAbsoluteDayTime
+	) {
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.get(chunkKey);
+		if (candidates == null || candidates.isEmpty()) {
+			return;
+		}
+		for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
+			if (candidate == null) {
+				continue;
+			}
+			EcosystemAPIManager.CandidateProgress advanced = EcosystemAPIManager.advanceCandidateProgress(
+				candidate.progressDecayTicks,
+				candidate.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				candidate.requiredDecayTicks
+			);
+			boolean changed = candidate.progressDecayTicks != advanced.progressGrowthTicks()
+				|| candidate.lastProcessedAbsoluteDayTime != advanced.lastProcessedAbsoluteDayTime()
+				|| candidate.startedAbsoluteDayTime != advanced.startedAbsoluteDayTime();
+			candidate.progressDecayTicks = advanced.progressGrowthTicks();
+			candidate.lastProcessedAbsoluteDayTime = advanced.lastProcessedAbsoluteDayTime();
+			candidate.startedAbsoluteDayTime = advanced.startedAbsoluteDayTime();
+			enqueueCandidateDue(chunkKey, candidate);
+			if (changed) {
+				EcosystemAPIManager.markChunkDirty(chunkKey);
+			}
+		}
+		refreshCandidateSchedule(chunkKey);
+	}
+
+	static long trackedCandidateCount() {
+		long count = 0L;
+		for (Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates : treeDecayCandidatesByChunk.values()) {
+			if (candidates != null) {
+				count += candidates.size();
+			}
+		}
+		return count;
+	}
+
 	static Collection<EcosystemAPIManager.TreeDecayCandidateState> getTreeDecayCandidates(EcosystemAPIManager.ChunkRefKey chunkKey) {
 		return chunkKey == null ? List.of() : treeDecayCandidatesByChunk.getOrDefault(chunkKey, Map.of()).values();
 	}
@@ -83,13 +167,19 @@ public final class EcosystemNaturalDecayManager {
 		if (chunkKey == null || candidate == null) {
 			return false;
 		}
-		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
-		if (candidates.containsKey(candidate.leafPos)) return false;
-		Map<Long, Long> targetOwners = treeDecayTargetOwnersByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
-		if (targetOwners.containsKey(candidate.targetPos)) return false;
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.get(chunkKey);
+		if (candidates != null && candidates.containsKey(candidate.leafPos)) return false;
+		Map<Long, Long> targetOwners = treeDecayTargetOwnersByChunk.get(chunkKey);
+		if (targetOwners != null && targetOwners.containsKey(candidate.targetPos)) return false;
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.leafPos, EcosystemAPIManager.CANDIDATE_DECAY)) {
+			return false;
+		}
+		candidates = treeDecayCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
+		targetOwners = treeDecayTargetOwnersByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.leafPos, candidate);
 		targetOwners.put(candidate.targetPos, candidate.leafPos);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.leafPos, EcosystemAPIManager.CANDIDATE_DECAY);
+		registerCandidateSchedule(chunkKey, candidate.progressDecayTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredDecayTicks);
+		enqueueCandidateDue(chunkKey, candidate);
 		return true;
 	}
 
@@ -150,7 +240,12 @@ public final class EcosystemNaturalDecayManager {
 			if (!placed.canSurvive(world, targetPos)) {
 				return false;
 			}
-			world.setBlockAndUpdate(targetPos, placed);
+			try (
+				@SuppressWarnings("unused")
+				EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+			) {
+				world.setBlockAndUpdate(targetPos, placed);
+			}
 			EcosystemAPIManager.invalidateCachedGroundPosition();
 			return true;
 		}
@@ -167,7 +262,12 @@ public final class EcosystemNaturalDecayManager {
 		if (updated == current) {
 			return false;
 		}
-		world.setBlockAndUpdate(targetPos, updated);
+		try (
+			@SuppressWarnings("unused")
+			EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+		) {
+			world.setBlockAndUpdate(targetPos, updated);
+		}
 		EcosystemAPIManager.invalidateCachedGroundPosition();
 		return true;
 	}
@@ -262,18 +362,227 @@ public final class EcosystemNaturalDecayManager {
 			return;
 		}
 
-		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
+		long currentAbsoluteDayTime = event.currentAbsoluteDayTime() == Long.MIN_VALUE
+			? EcosystemAPIManager.resolveCachedAbsoluteDayTime(world)
+			: event.currentAbsoluteDayTime();
 		int chunkX = event.chunk().getPos().x();
 		int chunkZ = event.chunk().getPos().z();
-		processTreeDecayCandidatesInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-		discoverTreeDecayCandidatesInColumn(world, event.chunk(), event.surfaceGroundPosition());
+		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
+			EcosystemAPIManager.levelId(world), chunkX, chunkZ
+		);
+		boolean decayCandidateWork = event.currentAbsoluteDayTime() == Long.MIN_VALUE
+			? hasDueCandidateWork(chunkKey, currentAbsoluteDayTime)
+			: event.decayCandidateWork();
+		if (decayCandidateWork) {
+			processTreeDecayCandidatesInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, event.workBudget());
+			refreshCandidateSchedule(chunkKey);
+		}
+		if (event.surfaceGroundPosition() != null) {
+			discoverTreeDecayCandidatesInColumn(world, event.chunk(), event.surfaceGroundPosition());
+		}
+	}
+
+	static boolean hasDueCandidateWork(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime
+	) {
+		if (world == null) {
+			return false;
+		}
+		return hasDueCandidateWork(
+			new EcosystemAPIManager.ChunkRefKey(EcosystemAPIManager.levelId(world), chunkX, chunkZ),
+			currentAbsoluteDayTime
+		);
+	}
+
+	static boolean hasDueCandidateWork(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		long currentAbsoluteDayTime
+	) {
+		if (chunkKey == null || !isEnabled()) {
+			return false;
+		}
+		Double nextDue = NEXT_CANDIDATE_DUE_BY_CHUNK.get(chunkKey);
+		Long maxLastProcessed = MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.get(chunkKey);
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.get(chunkKey);
+		if (candidates == null || candidates.isEmpty()) {
+			clearCandidateDueIndex(chunkKey);
+			return false;
+		}
+		PriorityQueue<CandidateDueEntry> queue = ensureCandidateDueQueue(chunkKey, candidates);
+		pruneCandidateDueQueue(chunkKey, candidates, queue);
+		CandidateDueEntry first = queue.peek();
+		if (first == null) {
+			clearCandidateDueIndex(chunkKey);
+			return false;
+		}
+		nextDue = first.nextDue;
+		NEXT_CANDIDATE_DUE_BY_CHUNK.put(chunkKey, nextDue);
+		return (
+			currentAbsoluteDayTime >= nextDue
+			|| (maxLastProcessed != null && currentAbsoluteDayTime < maxLastProcessed)
+		);
+	}
+
+	private static void registerCandidateSchedule(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		double progressDecayTicks,
+		long lastProcessedAbsoluteDayTime,
+		double requiredDecayTicks
+	) {
+		if (chunkKey == null) {
+			return;
+		}
+		double required = Double.isFinite(requiredDecayTicks) ? Math.max(1.0d, requiredDecayTicks) : 1.0d;
+		double progress = Double.isFinite(progressDecayTicks)
+			? Math.max(0.0d, Math.min(required, progressDecayTicks))
+			: 0.0d;
+		long lastProcessed = Math.max(0L, lastProcessedAbsoluteDayTime);
+		double nextDue = lastProcessed + Math.max(0.0d, required - progress);
+		Double existingNextDue = NEXT_CANDIDATE_DUE_BY_CHUNK.get(chunkKey);
+		if (existingNextDue == null || nextDue < existingNextDue) {
+			NEXT_CANDIDATE_DUE_BY_CHUNK.put(chunkKey, nextDue);
+		}
+		Long existingMaxLastProcessed = MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.get(chunkKey);
+		if (existingMaxLastProcessed == null || lastProcessed > existingMaxLastProcessed) {
+			MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.put(chunkKey, lastProcessed);
+		}
+	}
+
+	private static void refreshCandidateSchedule(EcosystemAPIManager.ChunkRefKey chunkKey) {
+		if (chunkKey == null) {
+			return;
+		}
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.get(chunkKey);
+		if (candidates == null || candidates.isEmpty()) {
+			clearCandidateDueIndex(chunkKey);
+			return;
+		}
+		PriorityQueue<CandidateDueEntry> queue = ensureCandidateDueQueue(chunkKey, candidates);
+		pruneCandidateDueQueue(chunkKey, candidates, queue);
+		if (queue.isEmpty()) {
+			clearCandidateDueIndex(chunkKey);
+			return;
+		}
+		if (queue.size() > candidates.size() * 2L + 16L) {
+			rebuildCandidateDueQueue(chunkKey, candidates);
+			queue = CANDIDATE_DUE_QUEUES.get(chunkKey);
+		}
+		CandidateDueEntry first = queue.peek();
+		NEXT_CANDIDATE_DUE_BY_CHUNK.put(chunkKey, first.nextDue);
+	}
+
+	private static PriorityQueue<CandidateDueEntry> ensureCandidateDueQueue(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates
+	) {
+		PriorityQueue<CandidateDueEntry> queue = CANDIDATE_DUE_QUEUES.get(chunkKey);
+		if (queue == null) {
+			rebuildCandidateDueQueue(chunkKey, candidates);
+			queue = CANDIDATE_DUE_QUEUES.get(chunkKey);
+		}
+		return queue;
+	}
+
+	private static void rebuildCandidateDueQueue(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates
+	) {
+		PriorityQueue<CandidateDueEntry> queue = new PriorityQueue<>((left, right) -> {
+			int dueComparison = Double.compare(left.nextDue, right.nextDue);
+			return dueComparison != 0 ? dueComparison : Long.compare(left.leafPos, right.leafPos);
+		});
+		Map<Long, Long> versions = new LinkedHashMap<>();
+		for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
+			if (candidate != null) {
+				versions.put(candidate.leafPos, 1L);
+				queue.add(new CandidateDueEntry(candidate.leafPos, candidateNextDue(candidate), 1L));
+			}
+		}
+		CANDIDATE_DUE_QUEUES.put(chunkKey, queue);
+		CANDIDATE_DUE_VERSIONS.put(chunkKey, versions);
+	}
+
+	private static void enqueueCandidateDue(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		EcosystemAPIManager.TreeDecayCandidateState candidate
+	) {
+		if (chunkKey == null || candidate == null) {
+			return;
+		}
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates = treeDecayCandidatesByChunk.get(chunkKey);
+		if (candidates == null || candidates.isEmpty()) {
+			return;
+		}
+		PriorityQueue<CandidateDueEntry> queue = ensureCandidateDueQueue(chunkKey, candidates);
+		Map<Long, Long> versions = CANDIDATE_DUE_VERSIONS.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
+		long version = versions.getOrDefault(candidate.leafPos, 0L) + 1L;
+		versions.put(candidate.leafPos, version);
+		queue.add(new CandidateDueEntry(candidate.leafPos, candidateNextDue(candidate), version));
+	}
+
+	private static void pruneCandidateDueQueue(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates,
+		PriorityQueue<CandidateDueEntry> queue
+	) {
+		Map<Long, Long> versions = CANDIDATE_DUE_VERSIONS.get(chunkKey);
+		while (!queue.isEmpty()) {
+			CandidateDueEntry entry = queue.peek();
+			EcosystemAPIManager.TreeDecayCandidateState candidate = candidates.get(entry.leafPos);
+			Long currentVersion = versions == null ? null : versions.get(entry.leafPos);
+			if (candidate != null && currentVersion != null && currentVersion == entry.version
+				&& Double.compare(candidateNextDue(candidate), entry.nextDue) == 0) {
+				return;
+			}
+			queue.poll();
+		}
+	}
+
+	private static void clearCandidateDueIndex(EcosystemAPIManager.ChunkRefKey chunkKey) {
+		NEXT_CANDIDATE_DUE_BY_CHUNK.remove(chunkKey);
+		MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.remove(chunkKey);
+		CANDIDATE_DUE_QUEUES.remove(chunkKey);
+		CANDIDATE_DUE_VERSIONS.remove(chunkKey);
+	}
+
+	private static double candidateNextDue(EcosystemAPIManager.TreeDecayCandidateState candidate) {
+		double required = Double.isFinite(candidate.requiredDecayTicks) ? Math.max(1.0d, candidate.requiredDecayTicks) : 1.0d;
+		double progress = Double.isFinite(candidate.progressDecayTicks)
+			? Math.max(0.0d, Math.min(required, candidate.progressDecayTicks))
+			: 0.0d;
+		long lastProcessed = Math.max(0L, candidate.lastProcessedAbsoluteDayTime);
+		return lastProcessed + Math.max(0.0d, required - progress);
+	}
+
+	private static void refreshMaxLastProcessed(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates
+	) {
+		long maxLastProcessed = Long.MIN_VALUE;
+		for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
+			if (candidate != null) {
+				maxLastProcessed = Math.max(maxLastProcessed, Math.max(0L, candidate.lastProcessedAbsoluteDayTime));
+			}
+		}
+		if (maxLastProcessed == Long.MIN_VALUE) {
+			MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.remove(chunkKey);
+		} else {
+			MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.put(chunkKey, maxLastProcessed);
+		}
+	}
+
+	private record CandidateDueEntry(long leafPos, double nextDue, long version) {
 	}
 
 	private static void processTreeDecayCandidatesInChunk(
 		ServerLevel world,
 		int chunkX,
 		int chunkZ,
-		long currentAbsoluteDayTime
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
 	) {
 		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
 			EcosystemAPIManager.levelId(world), chunkX, chunkZ
@@ -282,11 +591,85 @@ public final class EcosystemNaturalDecayManager {
 		if (candidates == null || candidates.isEmpty()) {
 			return;
 		}
-		for (EcosystemAPIManager.TreeDecayCandidateState candidate : new ArrayList<>(candidates.values())) {
-			if (candidate != null) {
-				processTreeDecayCandidateAt(world, BlockPos.of(candidate.leafPos), currentAbsoluteDayTime);
-			}
+		if (!workBudget.hasRemaining()) {
+			return;
 		}
+		Long maxLastProcessed = MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.get(chunkKey);
+		if (maxLastProcessed != null && currentAbsoluteDayTime < maxLastProcessed) {
+			processTreeDecayCandidatesAfterClockRollback(
+				world, candidates, currentAbsoluteDayTime, workBudget
+			);
+			refreshMaxLastProcessed(chunkKey, candidates);
+			refreshCandidateSchedule(chunkKey);
+			return;
+		}
+
+		PriorityQueue<CandidateDueEntry> queue = ensureCandidateDueQueue(chunkKey, candidates);
+		pruneCandidateDueQueue(chunkKey, candidates, queue);
+		while (workBudget.hasRemaining() && !queue.isEmpty()) {
+			CandidateDueEntry entry = queue.peek();
+			if (entry == null || currentAbsoluteDayTime < entry.nextDue) {
+				break;
+			}
+			queue.poll();
+			Map<Long, Long> versions = CANDIDATE_DUE_VERSIONS.get(chunkKey);
+			Long currentVersion = versions == null ? null : versions.get(entry.leafPos);
+			EcosystemAPIManager.TreeDecayCandidateState candidate = candidates.get(entry.leafPos);
+			if (candidate == null || currentVersion == null || currentVersion != entry.version
+				|| Double.compare(candidateNextDue(candidate), entry.nextDue) != 0) {
+				continue;
+			}
+			if (!EcosystemAPIManager.isCandidateDue(
+				candidate.progressDecayTicks,
+				candidate.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				candidate.requiredDecayTicks
+			)) {
+				enqueueCandidateDue(chunkKey, candidate);
+				continue;
+			}
+			processTreeDecayCandidate(world, candidate, currentAbsoluteDayTime, workBudget);
+		}
+		refreshCandidateSchedule(chunkKey);
+	}
+
+	private static void processTreeDecayCandidatesAfterClockRollback(
+		ServerLevel world,
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> candidates,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
+		for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
+			if (!workBudget.hasRemaining()) {
+				return;
+			}
+			if (candidate == null || currentAbsoluteDayTime >= candidate.lastProcessedAbsoluteDayTime
+				|| !workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_DECAY)) {
+				continue;
+			}
+			processTreeDecayCandidateMeasured(world, candidate, currentAbsoluteDayTime);
+		}
+	}
+
+	private static void processTreeDecayCandidate(
+		ServerLevel world,
+		EcosystemAPIManager.TreeDecayCandidateState candidate,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
+		if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_DECAY)) {
+			return;
+		}
+		processTreeDecayCandidateMeasured(world, candidate, currentAbsoluteDayTime);
+	}
+
+	private static void processTreeDecayCandidateMeasured(
+		ServerLevel world,
+		EcosystemAPIManager.TreeDecayCandidateState candidate,
+		long currentAbsoluteDayTime
+	) {
+		BlockPos candidatePosition = BlockPos.of(candidate.leafPos);
+		processTreeDecayCandidateAt(world, candidatePosition, currentAbsoluteDayTime);
 	}
 
 	private static void discoverTreeDecayCandidatesInColumn(
@@ -302,6 +685,10 @@ public final class EcosystemNaturalDecayManager {
 		int z = surfaceGroundPosition.getZ();
 		int chunkX = chunk.getPos().x();
 		int chunkZ = chunk.getPos().z();
+		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
+			EcosystemAPIManager.levelId(world), chunkX, chunkZ
+		);
+		Map<Long, EcosystemAPIManager.TreeDecayCandidateState> existingCandidates = treeDecayCandidatesByChunk.get(chunkKey);
 		int topY = Math.min(
 			world.getMaxY() - 1,
 			chunk.getHeight(
@@ -334,6 +721,9 @@ public final class EcosystemNaturalDecayManager {
 			int lastY = Math.min(topY, sectionMinY + 15);
 			for (int y = firstY; y <= lastY; y++) {
 				BlockPos leafPosition = new BlockPos(x, y, z);
+				if (existingCandidates != null && existingCandidates.containsKey(leafPosition.asLong())) {
+					continue;
+				}
 				BlockState leafState = world.getBlockState(leafPosition);
 				if (!leafState.is(BlockTags.LEAVES) || !isNaturallyGeneratedLeaf(leafState)) {
 					continue;
@@ -368,8 +758,17 @@ public final class EcosystemNaturalDecayManager {
 				treeDecayTargetOwnersByChunk.remove(chunkKey);
 			}
 		}
+		removeCandidateDue(chunkKey, packedPosition);
 		if (candidates.isEmpty()) {
 			treeDecayCandidatesByChunk.remove(chunkKey);
+		}
+		refreshCandidateSchedule(chunkKey);
+	}
+
+	private static void removeCandidateDue(EcosystemAPIManager.ChunkRefKey chunkKey, long leafPos) {
+		Map<Long, Long> versions = CANDIDATE_DUE_VERSIONS.get(chunkKey);
+		if (versions != null) {
+			versions.remove(leafPos);
 		}
 	}
 
@@ -513,7 +912,11 @@ public final class EcosystemNaturalDecayManager {
 		return belowState != null && EcosystemAPIManager.LEAF_LITTER_SUPPORT_BLOCKS.contains(belowState.getBlock());
 	}
 
-	private static void processTreeDecayCandidateAt(ServerLevel world, BlockPos position, long currentAbsoluteDayTime) {
+	private static void processTreeDecayCandidateAt(
+		ServerLevel world,
+		BlockPos position,
+		long currentAbsoluteDayTime
+	) {
 		if (world == null || position == null || !isEnabled()) {
 			return;
 		}
@@ -543,6 +946,7 @@ public final class EcosystemNaturalDecayManager {
 		candidate.progressDecayTicks = advanced.progressGrowthTicks();
 		candidate.lastProcessedAbsoluteDayTime = advanced.lastProcessedAbsoluteDayTime();
 		candidate.startedAbsoluteDayTime = advanced.startedAbsoluteDayTime();
+		enqueueCandidateDue(chunkKey, candidate);
 		if (progressChanged) {
 			EcosystemAPIManager.markChunkDirty(chunkKey);
 		}

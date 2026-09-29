@@ -10,6 +10,7 @@ import madoku.craft.java.core.time.TimeAPIManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.HolderGetter;
 import net.minecraft.core.Holder;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
@@ -33,11 +34,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -83,6 +86,7 @@ public final class EcosystemNaturalGrowthManager {
 	static final Map<EcosystemAPIManager.ChunkRefKey, Map<Long, EcosystemAPIManager.FoliageCandidateState>> foliageCandidatesByChunk = new LinkedHashMap<>();
 	private static final Map<EcosystemAPIManager.ChunkRefKey, Double> NEXT_CANDIDATE_DUE_BY_CHUNK = new LinkedHashMap<>();
 	private static final Map<EcosystemAPIManager.ChunkRefKey, Long> MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK = new LinkedHashMap<>();
+	private static final Map<RegistryAccess, Map<ResourceKey<Feature>, Optional<Holder.Reference<Feature>>>> TREE_FEATURE_HOLDER_CACHE = new IdentityHashMap<>();
 
 	private EcosystemNaturalGrowthManager() {
 	}
@@ -93,6 +97,7 @@ public final class EcosystemNaturalGrowthManager {
 
 	public static void reset() {
 		clearTrackedCandidateState();
+		clearTreeFeatureHolderCache();
 		TREE_TYPES_BY_BIOME.clear();
 	}
 
@@ -104,6 +109,10 @@ public final class EcosystemNaturalGrowthManager {
 		foliageCandidatesByChunk.clear();
 		NEXT_CANDIDATE_DUE_BY_CHUNK.clear();
 		MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.clear();
+	}
+
+	private static void clearTreeFeatureHolderCache() {
+		TREE_FEATURE_HOLDER_CACHE.clear();
 	}
 
 	/** Materializes lazy absolute-time progress before ecosystem data is persisted. */
@@ -273,7 +282,7 @@ public final class EcosystemNaturalGrowthManager {
 		Map<Long, EcosystemAPIManager.GrassCandidateState> grass = grassCandidatesByChunk.remove(chunkKey);
 		removeGrassCandidateBits(grass, EcosystemAPIManager.CANDIDATE_GRASS);
 		Map<Long, EcosystemAPIManager.GrassCandidateState> desertFoliage = desertFoliageGrowthCandidatesByChunk.remove(chunkKey);
-		removeGrassCandidateBits(desertFoliage, EcosystemAPIManager.CANDIDATE_FOLIAGE);
+		removeGrassCandidateBits(desertFoliage, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE);
 		Map<Long, EcosystemAPIManager.FoliageCandidateState> foliage = foliageCandidatesByChunk.remove(chunkKey);
 		if (foliage != null) {
 			for (EcosystemAPIManager.FoliageCandidateState candidate : foliage.values()) {
@@ -336,9 +345,13 @@ public final class EcosystemNaturalGrowthManager {
 		if (chunkKey == null || candidate == null) {
 			return null;
 		}
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_TREE)) {
+			return null;
+		}
 		EcosystemAPIManager.TreeCandidateState previous = treeCandidatesByChunk.put(chunkKey, candidate);
-		if (previous != null) EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
+		if (previous != null && previous.groundPos != candidate.groundPos) {
+			EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
+		}
 		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 		return previous;
 	}
@@ -350,9 +363,13 @@ public final class EcosystemNaturalGrowthManager {
 		if (chunkKey == null || candidate == null) {
 			return null;
 		}
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS)) {
+			return null;
+		}
 		EcosystemAPIManager.CactusCandidateState previous = cactusCandidatesByChunk.put(chunkKey, candidate);
-		if (previous != null) EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS);
+		if (previous != null && previous.groundPos != candidate.groundPos) {
+			EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS);
+		}
 		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 		return previous;
 	}
@@ -361,13 +378,16 @@ public final class EcosystemNaturalGrowthManager {
 		if (chunkKey == null || candidate == null) {
 			return;
 		}
-		Map<Long, EcosystemAPIManager.GrassCandidateState> candidates = grassCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
-		if (candidates.containsKey(candidate.groundPos)) return;
-		if (candidates.size() >= MAX_GRASS_CANDIDATES_PER_CHUNK) {
+		Map<Long, EcosystemAPIManager.GrassCandidateState> candidates = grassCandidatesByChunk.get(chunkKey);
+		if (candidates != null && candidates.containsKey(candidate.groundPos)) return;
+		if (candidates != null && candidates.size() >= MAX_GRASS_CANDIDATES_PER_CHUNK) {
 			return;
 		}
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_GRASS)) {
+			return;
+		}
+		candidates = grassCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_GRASS);
 		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
@@ -378,13 +398,16 @@ public final class EcosystemNaturalGrowthManager {
 		if (chunkKey == null || candidate == null) {
 			return;
 		}
-		Map<Long, EcosystemAPIManager.GrassCandidateState> candidates = desertFoliageGrowthCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
-		if (candidates.containsKey(candidate.groundPos)) return;
-		if (candidates.size() >= MAX_DESERT_FOLIAGE_GROWTH_CANDIDATES_PER_CHUNK) {
+		Map<Long, EcosystemAPIManager.GrassCandidateState> candidates = desertFoliageGrowthCandidatesByChunk.get(chunkKey);
+		if (candidates != null && candidates.containsKey(candidate.groundPos)) return;
+		if (candidates != null && candidates.size() >= MAX_DESERT_FOLIAGE_GROWTH_CANDIDATES_PER_CHUNK) {
 			return;
 		}
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE)) {
+			return;
+		}
+		candidates = desertFoliageGrowthCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
 		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
@@ -392,14 +415,17 @@ public final class EcosystemNaturalGrowthManager {
 		if (chunkKey == null || candidate == null) {
 			return;
 		}
-		Map<Long, EcosystemAPIManager.FoliageCandidateState> candidates = foliageCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
-		EcosystemAPIManager.FoliageCandidateState existing = candidates.get(candidate.groundPos);
-		if (existing != null && NaturalGrowthConfigManager.normalizeFoliageType(existing.foliageType).equals(NaturalGrowthConfigManager.normalizeFoliageType(candidate.foliageType))) return;
-		if (candidates.size() >= MAX_FOLIAGE_CANDIDATES_PER_CHUNK) {
+		Map<Long, EcosystemAPIManager.FoliageCandidateState> candidates = foliageCandidatesByChunk.get(chunkKey);
+		EcosystemAPIManager.FoliageCandidateState existing = candidates == null ? null : candidates.get(candidate.groundPos);
+		if (existing != null) return;
+		if (candidates != null && candidates.size() >= MAX_FOLIAGE_CANDIDATES_PER_CHUNK) {
 			return;
 		}
+		if (!EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE)) {
+			return;
+		}
+		candidates = foliageCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		EcosystemAPIManager.addCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
 		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
@@ -566,7 +592,12 @@ public final class EcosystemNaturalGrowthManager {
 		return tryGrowTreeAtGround(world, groundPos, treeType, false);
 	}
 
-	private static boolean tryGrowTreeAtGround(ServerLevel world, BlockPos groundPos, String treeType, boolean clearanceAlreadyChecked) {
+	private static boolean tryGrowTreeAtGround(
+		ServerLevel world,
+		BlockPos groundPos,
+		String treeType,
+		boolean clearanceAlreadyChecked
+	) {
 		if (world == null || groundPos == null || treeType == null || treeType.isBlank() || !isTreeGrowthEnabled(treeType)) {
 			return false;
 		}
@@ -575,8 +606,11 @@ public final class EcosystemNaturalGrowthManager {
 		if (!aboveState.isAir() && !aboveState.is(Blocks.SNOW)) {
 			return false;
 		}
-		if (!clearanceAlreadyChecked && !hasNaturalGrowthClearance(world, treePos)) {
-			return false;
+		if (!clearanceAlreadyChecked) {
+			boolean hasClearance = hasNaturalGrowthClearance(world, treePos);
+			if (!hasClearance) {
+				return false;
+			}
 		}
 
 		BlockState replacedState = aboveState;
@@ -592,16 +626,21 @@ public final class EcosystemNaturalGrowthManager {
 			return false;
 		}
 
-		HolderGetter<Feature> configuredFeatures = world.registryAccess().lookupOrThrow(Registries.FEATURE);
-		java.util.Optional<Holder.Reference<Feature>> featureHolder = configuredFeatures.get(featureKey);
-		if (featureHolder.isEmpty()) {
+		Holder.Reference<Feature> featureHolder = resolveTreeFeatureHolder(world, featureKey);
+		if (featureHolder == null) {
 			if (replacedState.is(Blocks.SNOW) && world.getBlockState(treePos).isAir()) {
 				setBlockAndUpdate(world, treePos, replacedState);
 			}
 			return false;
 		}
 
-		boolean placed = featureHolder.get().value().place(world, world.getChunkSource().getGenerator(), world.getRandom(), treePos);
+		boolean placed;
+		try (
+			@SuppressWarnings("unused")
+			EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+		) {
+			placed = featureHolder.value().place(world, world.getChunkSource().getGenerator(), world.getRandom(), treePos);
+		}
 		EcosystemAPIManager.invalidateCachedGroundPosition();
 		if (!placed && replacedState.is(Blocks.SNOW) && world.getBlockState(treePos).isAir()) {
 			setBlockAndUpdate(world, treePos, replacedState);
@@ -609,7 +648,10 @@ public final class EcosystemNaturalGrowthManager {
 		return placed;
 	}
 
-	static boolean tryGrowGrassAtGround(ServerLevel world, BlockPos groundPos) {
+	static boolean tryGrowGrassAtGround(
+		ServerLevel world,
+		BlockPos groundPos
+	) {
 		if (world == null || groundPos == null) {
 			return false;
 		}
@@ -618,7 +660,12 @@ public final class EcosystemNaturalGrowthManager {
 			return false;
 		}
 
-		return tryPlaceWeightedFoliageTarget(world, growPos, buildGrassFoliagePlacements());
+		try (
+			@SuppressWarnings("unused")
+			EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+		) {
+			return tryPlaceWeightedFoliageTarget(world, growPos, buildGrassFoliagePlacements());
+		}
 	}
 
 	static boolean tryGrowFoliageAtGround(ServerLevel world, BlockPos groundPos, String foliageType) {
@@ -659,7 +706,10 @@ public final class EcosystemNaturalGrowthManager {
 		return true;
 	}
 
-	static boolean tryGrowDesertFoliageAtGround(ServerLevel world, BlockPos groundPos) {
+	static boolean tryGrowDesertFoliageAtGround(
+		ServerLevel world,
+		BlockPos groundPos
+	) {
 		if (world == null || groundPos == null || !EcosystemAPIManager.isDesertFoliageGrowthEnabled()) {
 			return false;
 		}
@@ -667,14 +717,25 @@ public final class EcosystemNaturalGrowthManager {
 		if (!world.getBlockState(growPos).isAir()) {
 			return false;
 		}
-		return placeSummerDesertTarget(world, growPos);
+		boolean placed;
+		try (
+			@SuppressWarnings("unused")
+			EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+		) {
+			placed = placeSummerDesertTarget(world, growPos);
+		}
+		return placed;
 	}
 
 	static boolean tryGrowCactusAtGround(ServerLevel world, BlockPos groundPos) {
 		return tryGrowCactusAtGround(world, groundPos, false);
 	}
 
-	private static boolean tryGrowCactusAtGround(ServerLevel world, BlockPos groundPos, boolean clearanceAlreadyChecked) {
+	private static boolean tryGrowCactusAtGround(
+		ServerLevel world,
+		BlockPos groundPos,
+		boolean clearanceAlreadyChecked
+	) {
 		if (world == null || groundPos == null || !EcosystemAPIManager.isCactusGrowthEnabled()) {
 			return false;
 		}
@@ -687,7 +748,12 @@ public final class EcosystemNaturalGrowthManager {
 		if (!next.canSurvive(world, growPos)) {
 			return false;
 		}
-		setBlockAndUpdate(world, growPos, next);
+		try (
+			@SuppressWarnings("unused")
+			EcosystemBlockChangeAPIManager.IndirectShapeUpdateScope ignored = EcosystemBlockChangeAPIManager.beginIndirectShapeUpdateOverride()
+		) {
+			setBlockAndUpdate(world, growPos, next);
+		}
 		return true;
 	}
 
@@ -825,6 +891,19 @@ public final class EcosystemNaturalGrowthManager {
 		return changed;
 	}
 
+	/** Temporary erosion A/B path: retain normal notifications but skip indirect shape propagation. */
+	private static boolean setWetBlockWithLimitedShapeUpdate(
+		ServerLevel world,
+		BlockPos position,
+		BlockState state
+	) {
+		boolean changed = world.setBlock(position, state, 3, 0);
+		if (changed) {
+			EcosystemAPIManager.invalidateCachedGroundPosition();
+		}
+		return changed;
+	}
+
 	private static boolean tryPlaceWeightedFoliageTarget(ServerLevel world, BlockPos growPos, List<WeightedFoliagePlacement> placements) {
 		if (world == null || growPos == null || placements == null || placements.isEmpty()) {
 			return false;
@@ -928,6 +1007,25 @@ public final class EcosystemNaturalGrowthManager {
 
 	private static boolean placeSummerDesertTarget(ServerLevel world, BlockPos growPos) {
 		return tryPlaceWeightedFoliageTarget(world, growPos, buildDesertFoliagePlacements());
+	}
+
+	private static Holder.Reference<Feature> resolveTreeFeatureHolder(ServerLevel world, ResourceKey<Feature> featureKey) {
+		if (world == null || featureKey == null) {
+			return null;
+		}
+
+		RegistryAccess registryAccess = world.registryAccess();
+		Map<ResourceKey<Feature>, Optional<Holder.Reference<Feature>>> holdersByKey = TREE_FEATURE_HOLDER_CACHE.computeIfAbsent(
+			registryAccess,
+			ignored -> new LinkedHashMap<>()
+		);
+		Optional<Holder.Reference<Feature>> cached = holdersByKey.get(featureKey);
+		if (cached == null) {
+			HolderGetter<Feature> configuredFeatures = registryAccess.lookupOrThrow(Registries.FEATURE);
+			cached = configuredFeatures.get(featureKey);
+			holdersByKey.put(featureKey, cached);
+		}
+		return cached.orElse(null);
 	}
 
 	private static ResourceKey<Feature> treeFeatureKeyForType(String treeType) {
@@ -1079,7 +1177,7 @@ public final class EcosystemNaturalGrowthManager {
 	}
 
 	public static void onChunkTick(EcosystemChunkTickEvent event) {
-		if (event == null || !isEnabled()) {
+		if (event == null) {
 			return;
 		}
 		ServerLevel world = event.level();
@@ -1087,20 +1185,29 @@ public final class EcosystemNaturalGrowthManager {
 			return;
 		}
 
-		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
+		long currentAbsoluteDayTime = event.currentAbsoluteDayTime() == Long.MIN_VALUE
+			? EcosystemAPIManager.resolveCachedAbsoluteDayTime(world)
+			: event.currentAbsoluteDayTime();
 		int chunkX = event.chunk().getPos().x();
 		int chunkZ = event.chunk().getPos().z();
 		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
 			EcosystemAPIManager.levelId(world), chunkX, chunkZ
 		);
-		if (shouldProcessCandidates(world, chunkKey, currentAbsoluteDayTime)) {
-			processDirtCandidatesInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-			processTreeCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-			processCactusCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-			processGrassCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-			processDesertFoliageGrowthCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
-			processFoliageCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime);
+		boolean growthCandidateWork = event.currentAbsoluteDayTime() == Long.MIN_VALUE
+			? hasDueCandidateWork(chunkKey, currentAbsoluteDayTime)
+			: event.growthCandidateWork();
+		if (growthCandidateWork) {
+			EcosystemChunkTickWorkBudget workBudget = event.workBudget();
+			processDirtCandidatesInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
+			processTreeCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
+			processCactusCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
+			processGrassCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
+			processDesertFoliageGrowthCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
+			processFoliageCandidateInChunk(world, chunkX, chunkZ, currentAbsoluteDayTime, workBudget);
 			refreshCandidateSchedule(chunkKey);
+		}
+		if (!isEnabled()) {
+			return;
 		}
 
 		BlockPos surfaceGroundPosition = event.surfaceGroundPosition();
@@ -1116,36 +1223,36 @@ public final class EcosystemNaturalGrowthManager {
 		discoverSurfaceSample(world, chunkX, chunkZ, sample);
 	}
 
-	private static boolean hasTrackedCandidateInChunk(ServerLevel world, int chunkX, int chunkZ) {
-		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
-			EcosystemAPIManager.levelId(world), chunkX, chunkZ
+	static boolean hasDueCandidateWork(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime
+	) {
+		if (world == null) {
+			return false;
+		}
+		return hasDueCandidateWork(
+			new EcosystemAPIManager.ChunkRefKey(EcosystemAPIManager.levelId(world), chunkX, chunkZ),
+			currentAbsoluteDayTime
 		);
-		return EcosystemAPIManager.dirtKeysByChunk.containsKey(chunkKey)
-			|| treeCandidatesByChunk.containsKey(chunkKey)
-			|| cactusCandidatesByChunk.containsKey(chunkKey)
-			|| grassCandidatesByChunk.containsKey(chunkKey)
-			|| desertFoliageGrowthCandidatesByChunk.containsKey(chunkKey)
-			|| foliageCandidatesByChunk.containsKey(chunkKey);
 	}
 
-	private static boolean shouldProcessCandidates(
-		ServerLevel world,
+	static boolean hasDueCandidateWork(
 		EcosystemAPIManager.ChunkRefKey chunkKey,
 		long currentAbsoluteDayTime
 	) {
-		if (world == null || chunkKey == null || !hasTrackedCandidateInChunk(world, chunkKey.chunkX(), chunkKey.chunkZ())) {
-			if (chunkKey != null) {
-				NEXT_CANDIDATE_DUE_BY_CHUNK.remove(chunkKey);
-				MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.remove(chunkKey);
-			}
+		// Dirt candidates also contain wet erosion work, which must progress even
+		// when the natural-growth settings are disabled independently.
+		if (chunkKey == null) {
 			return false;
 		}
-
 		Double nextDue = NEXT_CANDIDATE_DUE_BY_CHUNK.get(chunkKey);
 		Long maxLastProcessed = MAX_CANDIDATE_LAST_PROCESSED_BY_CHUNK.get(chunkKey);
-		return nextDue == null
-			|| currentAbsoluteDayTime >= nextDue
-			|| (maxLastProcessed != null && currentAbsoluteDayTime < maxLastProcessed);
+		return nextDue != null && (
+			currentAbsoluteDayTime >= nextDue
+			|| (maxLastProcessed != null && currentAbsoluteDayTime < maxLastProcessed)
+		);
 	}
 
 	static void registerCandidateSchedule(
@@ -1270,7 +1377,13 @@ public final class EcosystemNaturalGrowthManager {
 		private long maxLastProcessed = Long.MIN_VALUE;
 	}
 
-	private static void processDirtCandidatesInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	private static void processDirtCandidatesInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		EcosystemAPIManager.ChunkRefKey chunkKey = new EcosystemAPIManager.ChunkRefKey(
 			EcosystemAPIManager.levelId(world), chunkX, chunkZ
 		);
@@ -1278,9 +1391,29 @@ public final class EcosystemNaturalGrowthManager {
 		if (dirtKeys == null || dirtKeys.isEmpty()) {
 			return;
 		}
-		for (String dirtKey : List.copyOf(dirtKeys)) {
+		int remainingOperations = workBudget.remainingCandidateOperations();
+		if (remainingOperations <= 0) {
+			return;
+		}
+		List<String> candidateKeys = new ArrayList<>(Math.min(dirtKeys.size(), remainingOperations));
+		for (String dirtKey : dirtKeys) {
 			EcosystemAPIManager.DirtState dirt = EcosystemAPIManager.dirtBlocksByKey.get(dirtKey);
-			if (dirt != null) {
+			if (dirt != null && EcosystemAPIManager.isCandidateDue(
+				dirt.progressGrowthTicks,
+				dirt.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				dirt.requiredGrowthTicks
+			)) {
+				candidateKeys.add(dirtKey);
+			} else if (dirt != null) {
+			}
+			if (candidateKeys.size() >= remainingOperations) {
+				break;
+			}
+		}
+		for (String dirtKey : candidateKeys) {
+			EcosystemAPIManager.DirtState dirt = EcosystemAPIManager.dirtBlocksByKey.get(dirtKey);
+			if (dirt != null && workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_DIRT)) {
 				processDirtAtPosition(world, chunkX, chunkZ, currentAbsoluteDayTime, dirt.mode, dirt.dirtPos);
 			}
 		}
@@ -1299,7 +1432,7 @@ public final class EcosystemNaturalGrowthManager {
 			removeCactusCandidate(chunkKey);
 		}
 		removeGrassCandidateAt(grassCandidatesByChunk, chunkKey, packedPosition, EcosystemAPIManager.CANDIDATE_GRASS);
-		removeGrassCandidateAt(desertFoliageGrowthCandidatesByChunk, chunkKey, packedPosition, EcosystemAPIManager.CANDIDATE_FOLIAGE);
+		removeGrassCandidateAt(desertFoliageGrowthCandidatesByChunk, chunkKey, packedPosition, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE);
 		Map<Long, EcosystemAPIManager.FoliageCandidateState> foliage = foliageCandidatesByChunk.get(chunkKey);
 		if (foliage != null && foliage.remove(packedPosition) != null) {
 			EcosystemAPIManager.removeCandidatePositionBit(
@@ -1933,6 +2066,11 @@ public final class EcosystemNaturalGrowthManager {
 			|| treeCandidatesByChunk.containsKey(chunkKey)) {
 			return;
 		}
+		if (!EcosystemAPIManager.canClaimCandidatePosition(
+			EcosystemAPIManager.levelId(world), groundPos.asLong(), EcosystemAPIManager.CANDIDATE_TREE
+		)) {
+			return;
+		}
 
 		Holder<net.minecraft.world.level.biome.Biome> biomeHolder = sampledBiome == null
 			? world.getBiome(groundPos)
@@ -1966,7 +2104,12 @@ public final class EcosystemNaturalGrowthManager {
 	) {
 		if (world == null || chunkKey == null || groundPos == null || groundState == null
 			|| !EcosystemAPIManager.isNaturalGrowthEnabled()
-			|| cactusCandidatesByChunk.containsKey(chunkKey)
+			|| cactusCandidatesByChunk.containsKey(chunkKey)) {
+			return;
+		}
+		if (!EcosystemAPIManager.canClaimCandidatePosition(
+			EcosystemAPIManager.levelId(world), groundPos.asLong(), EcosystemAPIManager.CANDIDATE_CACTUS
+			)
 			|| !isValidCactusGroundCandidate(world, groundPos, groundState, aboveState, sampledBiome, sampledSubmerged)) {
 			return;
 		}
@@ -2007,6 +2150,11 @@ public final class EcosystemNaturalGrowthManager {
 			|| !EcosystemAPIManager.isNaturalGrowthEnabled()) {
 			return;
 		}
+		if (!EcosystemAPIManager.canClaimCandidatePosition(
+			EcosystemAPIManager.levelId(world), groundPos.asLong(), EcosystemAPIManager.CANDIDATE_GRASS
+		)) {
+			return;
+		}
 		Map<Long, EcosystemAPIManager.GrassCandidateState> existingCandidates = grassCandidatesByChunk.get(chunkKey);
 		if (existingCandidates != null && existingCandidates.size() >= MAX_GRASS_CANDIDATES_PER_CHUNK) {
 			return;
@@ -2023,9 +2171,9 @@ public final class EcosystemNaturalGrowthManager {
 			return;
 		}
 		long currentAbsoluteDayTime = TimeAPIManager.getCurrentAbsoluteDayTime(world);
-		grassCandidatesByChunk
-			.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-			.put(packedGroundPos, new EcosystemAPIManager.GrassCandidateState(
+		putGrassCandidate(
+			chunkKey,
+			new EcosystemAPIManager.GrassCandidateState(
 				EcosystemAPIManager.levelId(world),
 				chunkX,
 				chunkZ,
@@ -2034,9 +2182,8 @@ public final class EcosystemNaturalGrowthManager {
 				requiredGrowthTicks,
 				0.0d,
 				currentAbsoluteDayTime
-			));
-		EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), packedGroundPos, EcosystemAPIManager.CANDIDATE_GRASS);
-		registerCandidateSchedule(chunkKey, 0.0d, currentAbsoluteDayTime, requiredGrowthTicks);
+			)
+		);
 		EcosystemAPIManager.dirty = true;
 	}
 
@@ -2056,6 +2203,11 @@ public final class EcosystemNaturalGrowthManager {
 			|| !EcosystemAPIManager.isNaturalGrowthEnabled()) {
 			return;
 		}
+		if (!EcosystemAPIManager.canClaimCandidatePosition(
+			EcosystemAPIManager.levelId(world), groundPos.asLong(), EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE
+		)) {
+			return;
+		}
 		Map<Long, EcosystemAPIManager.GrassCandidateState> existingCandidates = desertFoliageGrowthCandidatesByChunk.get(chunkKey);
 		if (existingCandidates != null && existingCandidates.size() >= MAX_DESERT_FOLIAGE_GROWTH_CANDIDATES_PER_CHUNK) {
 			return;
@@ -2072,9 +2224,9 @@ public final class EcosystemNaturalGrowthManager {
 			return;
 		}
 		long currentAbsoluteDayTime = TimeAPIManager.getCurrentAbsoluteDayTime(world);
-		desertFoliageGrowthCandidatesByChunk
-			.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-			.put(packedGroundPos, new EcosystemAPIManager.GrassCandidateState(
+		putDesertFoliageGrowthCandidate(
+			chunkKey,
+			new EcosystemAPIManager.GrassCandidateState(
 				EcosystemAPIManager.levelId(world),
 				chunkX,
 				chunkZ,
@@ -2083,9 +2235,8 @@ public final class EcosystemNaturalGrowthManager {
 				requiredGrowthTicks,
 				0.0d,
 				currentAbsoluteDayTime
-			));
-		EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), packedGroundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
-		registerCandidateSchedule(chunkKey, 0.0d, currentAbsoluteDayTime, requiredGrowthTicks);
+			)
+		);
 		EcosystemAPIManager.dirty = true;
 	}
 
@@ -2104,6 +2255,11 @@ public final class EcosystemNaturalGrowthManager {
 	) {
 		if (world == null || chunkKey == null || groundPos == null || groundState == null
 			|| !EcosystemAPIManager.isNaturalGrowthEnabled()) {
+			return;
+		}
+		if (!EcosystemAPIManager.canClaimCandidatePosition(
+			EcosystemAPIManager.levelId(world), groundPos.asLong(), EcosystemAPIManager.CANDIDATE_FOLIAGE
+		)) {
 			return;
 		}
 		String normalizedFoliageType = NaturalGrowthConfigManager.normalizeFoliageType(foliageType);
@@ -2129,9 +2285,9 @@ public final class EcosystemNaturalGrowthManager {
 			return;
 		}
 		long currentAbsoluteDayTime = TimeAPIManager.getCurrentAbsoluteDayTime(world);
-		foliageCandidatesByChunk
-			.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-			.put(packedGroundPos, new EcosystemAPIManager.FoliageCandidateState(
+		putFoliageCandidate(
+			chunkKey,
+			new EcosystemAPIManager.FoliageCandidateState(
 				EcosystemAPIManager.levelId(world),
 				chunkX,
 				chunkZ,
@@ -2141,9 +2297,8 @@ public final class EcosystemNaturalGrowthManager {
 				requiredGrowthTicks,
 				0.0d,
 				currentAbsoluteDayTime
-			));
-		EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), packedGroundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
-		registerCandidateSchedule(chunkKey, 0.0d, currentAbsoluteDayTime, requiredGrowthTicks);
+			)
+		);
 		EcosystemAPIManager.dirty = true;
 	}
 
@@ -2180,6 +2335,11 @@ public final class EcosystemNaturalGrowthManager {
 		List<EcosystemAPIManager.TreeCandidateOption> options = new ArrayList<>();
 		for (Long packedPos : treeGroundCandidates) {
 			if (packedPos == null) {
+				continue;
+			}
+			if (!EcosystemAPIManager.canClaimCandidatePosition(
+				EcosystemAPIManager.levelId(world), packedPos, EcosystemAPIManager.CANDIDATE_TREE
+			)) {
 				continue;
 			}
 			BlockPos groundPos = BlockPos.of(packedPos);
@@ -2257,6 +2417,11 @@ public final class EcosystemNaturalGrowthManager {
 			if (packedPos == null) {
 				continue;
 			}
+			if (!EcosystemAPIManager.canClaimCandidatePosition(
+				EcosystemAPIManager.levelId(world), packedPos, EcosystemAPIManager.CANDIDATE_CACTUS
+			)) {
+				continue;
+			}
 			BlockPos groundPos = BlockPos.of(packedPos);
 			if (!isValidCactusGroundCandidate(world, groundPos, discoveredGroundState(world, groundPos, sample), discoveredAboveState(groundPos, sample))) {
 				continue;
@@ -2306,6 +2471,11 @@ public final class EcosystemNaturalGrowthManager {
 			if (packedPos == null) {
 				continue;
 			}
+			if (!EcosystemAPIManager.canClaimCandidatePosition(
+				EcosystemAPIManager.levelId(world), packedPos, EcosystemAPIManager.CANDIDATE_GRASS
+			)) {
+				continue;
+			}
 			BlockPos groundPos = BlockPos.of(packedPos);
 			if (isValidGrassGroundCandidate(world, groundPos, discoveredGroundState(world, groundPos, sample), discoveredAboveState(groundPos, sample))) {
 				if (existingCandidates != null && existingCandidates.containsKey(packedPos)) {
@@ -2329,9 +2499,9 @@ public final class EcosystemNaturalGrowthManager {
 		for (int i = 0; i < candidatesToAdd; i++) {
 			int selectedIndex = ThreadLocalRandom.current().nextInt(options.size());
 			long selectedGroundPos = options.remove(selectedIndex);
-			grassCandidatesByChunk
-				.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-				.put(selectedGroundPos, new EcosystemAPIManager.GrassCandidateState(
+			putGrassCandidate(
+				chunkKey,
+				new EcosystemAPIManager.GrassCandidateState(
 					EcosystemAPIManager.levelId(world),
 					chunkX,
 					chunkZ,
@@ -2340,13 +2510,7 @@ public final class EcosystemNaturalGrowthManager {
 					requiredGrowthTicks,
 					0.0d,
 					TimeAPIManager.getCurrentAbsoluteDayTime(world)
-				));
-			EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), selectedGroundPos, EcosystemAPIManager.CANDIDATE_GRASS);
-			registerCandidateSchedule(
-				chunkKey,
-				0.0d,
-				TimeAPIManager.getCurrentAbsoluteDayTime(world),
-				requiredGrowthTicks
+				)
 			);
 			EcosystemAPIManager.dirty = true;
 		}
@@ -2374,6 +2538,11 @@ public final class EcosystemNaturalGrowthManager {
 			if (packedPos == null) {
 				continue;
 			}
+			if (!EcosystemAPIManager.canClaimCandidatePosition(
+				EcosystemAPIManager.levelId(world), packedPos, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE
+			)) {
+				continue;
+			}
 			BlockPos groundPos = BlockPos.of(packedPos);
 			if (isValidDesertFoliageGrowthGroundCandidate(world, groundPos, discoveredGroundState(world, groundPos, sample), discoveredAboveState(groundPos, sample))) {
 				if (existingCandidates != null && existingCandidates.containsKey(packedPos)) {
@@ -2397,9 +2566,9 @@ public final class EcosystemNaturalGrowthManager {
 		for (int i = 0; i < candidatesToAdd; i++) {
 			int selectedIndex = ThreadLocalRandom.current().nextInt(options.size());
 			long selectedGroundPos = options.remove(selectedIndex);
-			desertFoliageGrowthCandidatesByChunk
-				.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-				.put(selectedGroundPos, new EcosystemAPIManager.GrassCandidateState(
+			putDesertFoliageGrowthCandidate(
+				chunkKey,
+				new EcosystemAPIManager.GrassCandidateState(
 					EcosystemAPIManager.levelId(world),
 					chunkX,
 					chunkZ,
@@ -2408,13 +2577,7 @@ public final class EcosystemNaturalGrowthManager {
 					requiredGrowthTicks,
 					0.0d,
 					TimeAPIManager.getCurrentAbsoluteDayTime(world)
-				));
-			EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), selectedGroundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
-			registerCandidateSchedule(
-				chunkKey,
-				0.0d,
-				TimeAPIManager.getCurrentAbsoluteDayTime(world),
-				requiredGrowthTicks
+				)
 			);
 			EcosystemAPIManager.dirty = true;
 		}
@@ -2460,6 +2623,11 @@ public final class EcosystemNaturalGrowthManager {
 			if (packedPos == null) {
 				continue;
 			}
+			if (!EcosystemAPIManager.canClaimCandidatePosition(
+				EcosystemAPIManager.levelId(world), packedPos, EcosystemAPIManager.CANDIDATE_FOLIAGE
+			)) {
+				continue;
+			}
 			BlockPos groundPos = BlockPos.of(packedPos);
 			if (isValidFoliageGroundCandidate(world, groundPos, discoveredGroundState(world, groundPos, sample), normalizedFoliageType, discoveredAboveState(groundPos, sample))) {
 				EcosystemAPIManager.FoliageCandidateState existing = existingCandidates == null ? null : existingCandidates.get(packedPos);
@@ -2484,9 +2652,9 @@ public final class EcosystemNaturalGrowthManager {
 		for (int i = 0; i < candidatesToAdd; i++) {
 			int selectedIndex = ThreadLocalRandom.current().nextInt(options.size());
 			long selectedGroundPos = options.remove(selectedIndex);
-			foliageCandidatesByChunk
-				.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>())
-				.put(selectedGroundPos, new EcosystemAPIManager.FoliageCandidateState(
+			putFoliageCandidate(
+				chunkKey,
+				new EcosystemAPIManager.FoliageCandidateState(
 					EcosystemAPIManager.levelId(world),
 					chunkX,
 					chunkZ,
@@ -2496,19 +2664,13 @@ public final class EcosystemNaturalGrowthManager {
 					requiredGrowthTicks,
 					0.0d,
 					TimeAPIManager.getCurrentAbsoluteDayTime(world)
-				));
-			EcosystemAPIManager.addCandidatePositionBit(EcosystemAPIManager.levelId(world), selectedGroundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
-			registerCandidateSchedule(
-				chunkKey,
-				0.0d,
-				TimeAPIManager.getCurrentAbsoluteDayTime(world),
-				requiredGrowthTicks
+				)
 			);
 			EcosystemAPIManager.dirty = true;
 		}
 	}
 
-	static void processDirtAtPosition(
+	private static void processDirtAtPosition(
 		ServerLevel world,
 		int chunkX,
 		int chunkZ,
@@ -2548,11 +2710,15 @@ public final class EcosystemNaturalGrowthManager {
 		if (!due) {
 			return;
 		}
+		if ("wet".equals(targetMode)) {
+		}
 		BlockState state = world.getBlockState(dirtPos);
 		boolean stillEligible = "wet".equals(dirt.mode)
 			? EcosystemNaturalErosionManager.isWetTrackedCandidate(world, dirtPos, state, dirt.erosionRuleId)
 			: EcosystemAPIManager.isCandidateForMode(world, dirtPos, state, dirt.mode);
 		if (!EcosystemNaturalErosionManager.isTrackableGroundBlock(state) || !stillEligible) {
+			if ("wet".equals(targetMode)) {
+			}
 			EcosystemAPIManager.removeDirtStateByKey(dirt.key());
 			return;
 		}
@@ -2562,12 +2728,27 @@ public final class EcosystemNaturalGrowthManager {
 			: EcosystemNaturalErosionManager.resolveWetGroundReplacementBlock(world, dirtPos, state, dirt.erosionRuleId);
 		boolean replacementApplied = replacement != null && replacement != state.getBlock();
 		if (replacementApplied) {
-			setBlockAndUpdate(world, dirtPos, replacement.defaultBlockState());
+			BlockState replacementState = replacement.defaultBlockState();
+			setWetBlockWithLimitedShapeUpdate(
+				world,
+				dirtPos,
+				replacementState
+			);
+			if ("wet".equals(targetMode)) {
+			}
+		}
+		if ("wet".equals(targetMode)) {
 		}
 		EcosystemAPIManager.removeDirtStateByKey(dirt.key());
 	}
 
-	static void processTreeCandidateInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	static void processTreeCandidateInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		if (world == null || !isEnabled()) {
 			return;
 		}
@@ -2577,7 +2758,17 @@ public final class EcosystemNaturalGrowthManager {
 		if (candidate == null) {
 			return;
 		}
-
+		if (!EcosystemAPIManager.isCandidateDue(
+			candidate.progressGrowthTicks,
+			candidate.lastProcessedAbsoluteDayTime,
+			currentAbsoluteDayTime,
+			candidate.requiredGrowthTicks
+		)) {
+			return;
+		}
+		if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_TREE)) {
+			return;
+		}
 		if (!candidate.levelId.equals(EcosystemAPIManager.levelId(world)) || candidate.chunkX != chunkX || candidate.chunkZ != chunkZ) {
 			EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
 			treeCandidatesByChunk.remove(chunkKey);
@@ -2614,7 +2805,6 @@ public final class EcosystemNaturalGrowthManager {
 			EcosystemAPIManager.markChunkDirty(chunkKey);
 			return;
 		}
-
 		if (currentProgress + 1e-6d >= candidate.requiredGrowthTicks) {
 			tryGrowTreeAtGround(world, groundPos, candidate.treeType, true);
 			EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
@@ -2623,7 +2813,13 @@ public final class EcosystemNaturalGrowthManager {
 		}
 	}
 
-	static void processCactusCandidateInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	static void processCactusCandidateInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		if (world == null || !isEnabled()) {
 			return;
 		}
@@ -2633,7 +2829,17 @@ public final class EcosystemNaturalGrowthManager {
 		if (candidate == null) {
 			return;
 		}
-
+		if (!EcosystemAPIManager.isCandidateDue(
+			candidate.progressGrowthTicks,
+			candidate.lastProcessedAbsoluteDayTime,
+			currentAbsoluteDayTime,
+			candidate.requiredGrowthTicks
+		)) {
+			return;
+		}
+		if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_CACTUS)) {
+			return;
+		}
 		if (!candidate.levelId.equals(EcosystemAPIManager.levelId(world)) || candidate.chunkX != chunkX || candidate.chunkZ != chunkZ) {
 			EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS);
 			cactusCandidatesByChunk.remove(chunkKey);
@@ -2680,7 +2886,13 @@ public final class EcosystemNaturalGrowthManager {
 		}
 	}
 
-	static void processGrassCandidateInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	static void processGrassCandidateInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		if (world == null || !isEnabled()) {
 			return;
 		}
@@ -2708,7 +2920,17 @@ public final class EcosystemNaturalGrowthManager {
 				EcosystemAPIManager.markChunkDirty(chunkKey);
 				continue;
 			}
-
+			if (!EcosystemAPIManager.isCandidateDue(
+				candidate.progressGrowthTicks,
+				candidate.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				candidate.requiredGrowthTicks
+			)) {
+				continue;
+			}
+			if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_GRASS)) {
+				break;
+			}
 			BlockPos groundPos = BlockPos.of(candidate.groundPos);
 
 			EcosystemAPIManager.CandidateProgress advanced = EcosystemAPIManager.advanceCandidateProgress(
@@ -2761,7 +2983,13 @@ public final class EcosystemNaturalGrowthManager {
 	}
 
 
-	static void processDesertFoliageGrowthCandidateInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	static void processDesertFoliageGrowthCandidateInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		if (world == null || !isEnabled()) {
 			return;
 		}
@@ -2783,13 +3011,23 @@ public final class EcosystemNaturalGrowthManager {
 				continue;
 			}
 			if (!candidate.levelId.equals(EcosystemAPIManager.levelId(world)) || candidate.chunkX != chunkX || candidate.chunkZ != chunkZ) {
-				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
+				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE);
 				iterator.remove();
 				removedAny = true;
 				EcosystemAPIManager.markChunkDirty(chunkKey);
 				continue;
 			}
-
+			if (!EcosystemAPIManager.isCandidateDue(
+				candidate.progressGrowthTicks,
+				candidate.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				candidate.requiredGrowthTicks
+			)) {
+				continue;
+			}
+			if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_DESERT_FOLIAGE)) {
+				break;
+			}
 			BlockPos groundPos = BlockPos.of(candidate.groundPos);
 
 			EcosystemAPIManager.CandidateProgress advanced = EcosystemAPIManager.advanceCandidateProgress(
@@ -2815,7 +3053,7 @@ public final class EcosystemNaturalGrowthManager {
 
 			BlockState groundState = world.getBlockState(groundPos);
 			if (!isValidDesertFoliageGrowthGroundCandidate(world, groundPos, groundState)) {
-				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
+				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE);
 				iterator.remove();
 				removedAny = true;
 				EcosystemAPIManager.markChunkDirty(chunkKey);
@@ -2824,7 +3062,7 @@ public final class EcosystemNaturalGrowthManager {
 
 			if (currentProgress + 1e-6d >= candidate.requiredGrowthTicks) {
 				tryGrowDesertFoliageAtGround(world, groundPos);
-				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_FOLIAGE);
+				EcosystemAPIManager.removeCandidatePositionBit(candidate.levelId, candidate.groundPos, EcosystemAPIManager.CANDIDATE_DESERT_FOLIAGE);
 				iterator.remove();
 				removedAny = true;
 				EcosystemAPIManager.markChunkDirty(chunkKey);
@@ -2842,7 +3080,13 @@ public final class EcosystemNaturalGrowthManager {
 	}
 
 
-	static void processFoliageCandidateInChunk(ServerLevel world, int chunkX, int chunkZ, long currentAbsoluteDayTime) {
+	static void processFoliageCandidateInChunk(
+		ServerLevel world,
+		int chunkX,
+		int chunkZ,
+		long currentAbsoluteDayTime,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
 		if (world == null || !isEnabled()) {
 			return;
 		}
@@ -2870,7 +3114,17 @@ public final class EcosystemNaturalGrowthManager {
 				EcosystemAPIManager.markChunkDirty(chunkKey);
 				continue;
 			}
-
+			if (!EcosystemAPIManager.isCandidateDue(
+				candidate.progressGrowthTicks,
+				candidate.lastProcessedAbsoluteDayTime,
+				currentAbsoluteDayTime,
+				candidate.requiredGrowthTicks
+			)) {
+				continue;
+			}
+			if (!workBudget.tryConsumeCandidateOperation(EcosystemChunkTickWorkBudget.CANDIDATE_FOLIAGE)) {
+				break;
+			}
 			BlockPos groundPos = BlockPos.of(candidate.groundPos);
 
 			EcosystemAPIManager.CandidateProgress advanced = EcosystemAPIManager.advanceCandidateProgress(

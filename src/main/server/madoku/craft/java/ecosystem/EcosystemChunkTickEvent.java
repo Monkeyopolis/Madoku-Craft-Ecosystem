@@ -11,6 +11,54 @@ public record EcosystemChunkTickEvent(
 	LevelChunk chunk,
 	BlockPos surfaceGroundPosition,
 	BlockState surfaceGroundState,
-	BlockState surfaceAboveState
+	BlockState surfaceAboveState,
+	EcosystemChunkTickWorkBudget workBudget,
+	long currentAbsoluteDayTime,
+	boolean growthCandidateWork,
+	boolean decayCandidateWork
 ) {
+	public EcosystemChunkTickEvent(
+		ServerLevel level,
+		LevelChunk chunk,
+		BlockPos surfaceGroundPosition,
+		BlockState surfaceGroundState,
+		BlockState surfaceAboveState
+	) {
+		this(
+			level,
+			chunk,
+			surfaceGroundPosition,
+			surfaceGroundState,
+			surfaceAboveState,
+			new EcosystemChunkTickWorkBudget(),
+			Long.MIN_VALUE,
+			false,
+			false
+		);
+	}
+
+	public EcosystemChunkTickEvent(
+		ServerLevel level,
+		LevelChunk chunk,
+		BlockPos surfaceGroundPosition,
+		BlockState surfaceGroundState,
+		BlockState surfaceAboveState,
+		EcosystemChunkTickWorkBudget workBudget
+	) {
+		this(
+			level,
+			chunk,
+			surfaceGroundPosition,
+			surfaceGroundState,
+			surfaceAboveState,
+			workBudget,
+			Long.MIN_VALUE,
+			false,
+			false
+		);
+	}
+
+	public EcosystemChunkTickEvent {
+		workBudget = workBudget == null ? new EcosystemChunkTickWorkBudget() : workBudget;
+	}
 }

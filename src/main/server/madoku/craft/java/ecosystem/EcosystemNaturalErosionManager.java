@@ -23,8 +23,12 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class EcosystemNaturalErosionManager {
@@ -38,6 +42,11 @@ public final class EcosystemNaturalErosionManager {
 	private static final Map<String, ResourceKey<Biome>> BIOME_KEYS = new ConcurrentHashMap<>();
 	private static final Map<String, TagKey<Biome>> BIOME_TAG_KEYS = new ConcurrentHashMap<>();
 	private static final Map<Holder<Biome>, Map<String, Boolean>> BIOME_RULE_MATCHES = new ConcurrentHashMap<>();
+	private static final Map<Holder<Biome>, Map<ErosionRuleCacheKey, Optional<NaturalErosionConfigManager.NamedErosionRule>>> EROSION_RULE_RESOLUTION_CACHE = new ConcurrentHashMap<>();
+	private static final Map<String, SpreadTickState> SPREAD_STATES_BY_LEVEL = new LinkedHashMap<>();
+	private static final int RULE_RESOLUTION_GENERAL = 0;
+	private static final int RULE_RESOLUTION_WATER = 1;
+	private static final int RULE_RESOLUTION_LAVA = 2;
 
 	private EcosystemNaturalErosionManager() {
 	}
@@ -51,6 +60,8 @@ public final class EcosystemNaturalErosionManager {
 		BIOME_KEYS.clear();
 		BIOME_TAG_KEYS.clear();
 		BIOME_RULE_MATCHES.clear();
+		EROSION_RULE_RESOLUTION_CACHE.clear();
+		SPREAD_STATES_BY_LEVEL.clear();
 	}
 
 	private enum WetEligibility {
@@ -59,6 +70,44 @@ public final class EcosystemNaturalErosionManager {
 		NOT_SURFACE,
 		SUBMERGED,
 		NO_RULE
+	}
+
+	private record ErosionRuleCacheKey(String blockId, String preferredRuleId, int resolutionMode) {
+	}
+
+	private record AdjacentSeedMatch(
+		NaturalErosionConfigManager.NamedErosionRule rule,
+		BlockPos fluidSourcePosition
+	) {
+	}
+
+	private record SeedSpreadKey(long sourcePosition, String ruleId) {
+	}
+
+	private record SpreadCellKey(long position, String ruleId) {
+	}
+
+	private static final class SpreadTickState {
+		private long gameTime = Long.MIN_VALUE;
+		private final Set<SeedSpreadKey> processedSeeds = new LinkedHashSet<>();
+		private final Set<SpreadCellKey> scannedCells = new LinkedHashSet<>();
+
+		private void prepare(long currentGameTime) {
+			if (gameTime == currentGameTime) {
+				return;
+			}
+			gameTime = currentGameTime;
+			processedSeeds.clear();
+			scannedCells.clear();
+		}
+
+		private boolean markSeed(long sourcePosition, String ruleId) {
+			return processedSeeds.add(new SeedSpreadKey(sourcePosition, ruleId));
+		}
+
+		private boolean markCell(long position, String ruleId) {
+			return scannedCells.add(new SpreadCellKey(position, ruleId));
+		}
 	}
 
 
@@ -91,17 +140,29 @@ public final class EcosystemNaturalErosionManager {
 		}
 		boolean sampledSurfaceStillMatches = event.surfaceGroundState() != null
 			&& event.surfaceGroundState().equals(groundState);
-		NaturalErosionConfigManager.NamedErosionRule seedRule =
+		AdjacentSeedMatch seedMatch =
 			resolveAdjacentSeedRule(world, event.chunk(), position, groundState, sampledSurfaceStillMatches);
-		if (seedRule == null) {
+		if (seedMatch == null) {
 			return;
 		}
 
 		String seedKey = EcosystemAPIManager.levelId(world) + "|" + position.asLong();
 		EcosystemAPIManager.DirtState trackedSeed = EcosystemAPIManager.dirtBlocksByKey.get(seedKey);
-		if (trackedSeed == null || !"wet".equals(trackedSeed.mode)) {
-			spreadWetTrackingFromSeed(world, position, seedRule);
+		if (trackedSeed != null && "wet".equals(trackedSeed.mode)) {
+			return;
 		}
+
+		long currentGameTime = world.getGameTime();
+		SpreadTickState spreadState = SPREAD_STATES_BY_LEVEL.computeIfAbsent(
+			EcosystemAPIManager.levelId(world),
+			ignored -> new SpreadTickState()
+		);
+		spreadState.prepare(currentGameTime);
+		if (!spreadState.markSeed(seedMatch.fluidSourcePosition().asLong(), seedMatch.rule().ruleId())) {
+			return;
+		}
+
+		spreadWetTrackingFromSeed(world, position, seedMatch.rule(), spreadState);
 	}
 
 	/**
@@ -109,7 +170,7 @@ public final class EcosystemNaturalErosionManager {
 	 * still, same-height surface fluid. The configured radius is intentionally
 	 * not used here; it belongs to the one-time spread from the discovered seed.
 	 */
-	private static NaturalErosionConfigManager.NamedErosionRule resolveAdjacentSeedRule(
+	private static AdjacentSeedMatch resolveAdjacentSeedRule(
 		ServerLevel world,
 		LevelChunk chunk,
 		BlockPos blockPos,
@@ -129,8 +190,8 @@ public final class EcosystemNaturalErosionManager {
 			return null;
 		}
 
-		boolean waterSource = false;
-		boolean lavaSource = false;
+		BlockPos waterSourcePosition = null;
+		BlockPos lavaSourcePosition = null;
 		for (Direction direction : Direction.Plane.HORIZONTAL) {
 			BlockPos sourcePosition = blockPos.relative(direction);
 			var fluidState = world.getFluidState(sourcePosition);
@@ -140,37 +201,44 @@ public final class EcosystemNaturalErosionManager {
 			if (isWaterErosionEnabled()
 				&& fluidState.is(FluidTags.WATER)
 				&& isSurfaceFluidSource(world, chunk, sourcePosition, FluidTags.WATER)) {
-				waterSource = true;
+				if (waterSourcePosition == null) {
+					waterSourcePosition = sourcePosition;
+				}
 			}
 			if (isLavaErosionEnabled()
 				&& fluidState.is(FluidTags.LAVA)
 				&& isSurfaceFluidSource(world, chunk, sourcePosition, FluidTags.LAVA)) {
-				lavaSource = true;
+				if (lavaSourcePosition == null) {
+					lavaSourcePosition = sourcePosition;
+				}
 			}
 		}
-		if (!waterSource && !lavaSource) {
+		if (waterSourcePosition == null && lavaSourcePosition == null) {
 			return null;
 		}
 
-		NaturalErosionConfigManager.NamedErosionRule rule = waterSource
+		NaturalErosionConfigManager.NamedErosionRule rule = waterSourcePosition != null
 			? resolveErosionRuleForFluid(world, blockPos, state, true)
 			: null;
-		if (rule == null && lavaSource) {
+		BlockPos sourcePosition = waterSourcePosition;
+		if (rule == null && lavaSourcePosition != null) {
 			rule = resolveErosionRuleForFluid(world, blockPos, state, false);
+			sourcePosition = lavaSourcePosition;
 		}
-		if (rule == null) {
+		if (rule == null || sourcePosition == null) {
 			return null;
 		}
-		return rule;
+		return new AdjacentSeedMatch(rule, sourcePosition);
 	}
 
 	/** Spreads one discovered seed across the configured same-height surface radius. */
 	private static int spreadWetTrackingFromSeed(
 		ServerLevel world,
 		BlockPos seedPosition,
-		NaturalErosionConfigManager.NamedErosionRule seedRule
+		NaturalErosionConfigManager.NamedErosionRule seedRule,
+		SpreadTickState spreadState
 	) {
-		if (world == null || seedPosition == null || seedRule == null || seedRule.rule() == null) {
+		if (world == null || seedPosition == null || seedRule == null || seedRule.rule() == null || spreadState == null) {
 			return 0;
 		}
 		boolean waterSeed = isRuleForFluid(seedRule, true);
@@ -188,6 +256,9 @@ public final class EcosystemNaturalErosionManager {
 					continue;
 				}
 				BlockPos candidatePosition = seedPosition.offset(offsetX, 0, offsetZ);
+				if (!spreadState.markCell(candidatePosition.asLong(), seedRule.ruleId())) {
+					continue;
+				}
 				BlockState candidateState = world.getBlockState(candidatePosition);
 				WetEligibility candidateEligibility = evaluateWetEligibility(
 					world,
@@ -224,12 +295,36 @@ public final class EcosystemNaturalErosionManager {
 		if (blockId.isBlank()) {
 			return null;
 		}
+
+		Holder<Biome> biomeHolder = world.getBiome(pos);
+		Map<ErosionRuleCacheKey, Optional<NaturalErosionConfigManager.NamedErosionRule>> cachedByKey =
+			EROSION_RULE_RESOLUTION_CACHE.computeIfAbsent(biomeHolder, ignored -> new ConcurrentHashMap<>());
+		ErosionRuleCacheKey cacheKey = new ErosionRuleCacheKey(
+			blockId,
+			"",
+			water ? RULE_RESOLUTION_WATER : RULE_RESOLUTION_LAVA
+		);
+		Optional<NaturalErosionConfigManager.NamedErosionRule> cached = cachedByKey.get(cacheKey);
+		if (cached == null) {
+			cached = Optional.ofNullable(resolveErosionRuleForFluidUncached(world, pos, blockId, water, biomeHolder));
+			cachedByKey.put(cacheKey, cached);
+		}
+		return cached.orElse(null);
+	}
+
+	private static NaturalErosionConfigManager.NamedErosionRule resolveErosionRuleForFluidUncached(
+		ServerLevel world,
+		BlockPos pos,
+		String blockId,
+		boolean water,
+		Holder<Biome> biomeHolder
+	) {
 		for (NaturalErosionConfigManager.NamedErosionRule candidate : EcosystemAPIManager.cachedErosionRules) {
 			if (candidate == null || candidate.rule() == null || !isRuleForFluid(candidate, water)
 				|| !isErosionRuleEnabled(candidate.ruleId())) {
 				continue;
 			}
-			if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule())) {
+			if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule(), biomeHolder)) {
 				return candidate;
 			}
 		}
@@ -322,24 +417,52 @@ public final class EcosystemNaturalErosionManager {
 			return null;
 		}
 
+		String normalizedPreferredRuleId = preferredRuleId == null ? "" : EcosystemConfigManager.normalize(preferredRuleId);
+		Holder<Biome> biomeHolder = world.getBiome(pos);
+		Map<ErosionRuleCacheKey, Optional<NaturalErosionConfigManager.NamedErosionRule>> cachedByKey =
+			EROSION_RULE_RESOLUTION_CACHE.computeIfAbsent(biomeHolder, ignored -> new ConcurrentHashMap<>());
+		ErosionRuleCacheKey cacheKey = new ErosionRuleCacheKey(
+			blockId,
+			normalizedPreferredRuleId,
+			RULE_RESOLUTION_GENERAL
+		);
+		Optional<NaturalErosionConfigManager.NamedErosionRule> cached = cachedByKey.get(cacheKey);
+		if (cached == null) {
+			cached = Optional.ofNullable(resolveErosionRuleUncached(
+				world,
+				pos,
+				blockId,
+				normalizedPreferredRuleId,
+				biomeHolder
+			));
+			cachedByKey.put(cacheKey, cached);
+		}
+		return cached.orElse(null);
+	}
+
+	private static NaturalErosionConfigManager.NamedErosionRule resolveErosionRuleUncached(
+		ServerLevel world,
+		BlockPos pos,
+		String blockId,
+		String preferredRuleId,
+		Holder<Biome> biomeHolder
+	) {
 		NaturalErosionConfigManager.NamedErosionRule magmaRule = findErosionRuleById(NaturalErosionConfigManager.FIELD_MAGMA_BLOCK);
 		if (magmaRule != null && isLavaErosionEnabled()
-			&& matchesErosionRule(world, pos, blockId, magmaRule.ruleId(), magmaRule.rule())) {
+			&& matchesErosionRule(world, pos, blockId, magmaRule.ruleId(), magmaRule.rule(), biomeHolder)) {
 			return magmaRule;
 		}
 
 		if (preferredRuleId != null && !preferredRuleId.isBlank()) {
 			for (NaturalErosionConfigManager.NamedErosionRule candidate : EcosystemAPIManager.cachedErosionRules) {
-				if (!preferredRuleId.equals(candidate.ruleId())) {
+				if (candidate == null || !preferredRuleId.equals(candidate.ruleId())) {
 					continue;
 				}
-				if (!isErosionRuleEnabled(candidate.ruleId())) {
+				if (!isErosionRuleEnabled(candidate.ruleId())
+					|| NaturalErosionConfigManager.FIELD_MAGMA_BLOCK.equals(candidate.ruleId())) {
 					break;
 				}
-				if (NaturalErosionConfigManager.FIELD_MAGMA_BLOCK.equals(candidate.ruleId())) {
-					break;
-				}
-				if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule())) {
+				if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule(), biomeHolder)) {
 					return candidate;
 				}
 				break;
@@ -347,13 +470,11 @@ public final class EcosystemNaturalErosionManager {
 		}
 
 		for (NaturalErosionConfigManager.NamedErosionRule candidate : EcosystemAPIManager.cachedErosionRules) {
-			if (!isErosionRuleEnabled(candidate.ruleId())) {
+			if (candidate == null || !isErosionRuleEnabled(candidate.ruleId())
+				|| NaturalErosionConfigManager.FIELD_MAGMA_BLOCK.equals(candidate.ruleId())) {
 				continue;
 			}
-			if (NaturalErosionConfigManager.FIELD_MAGMA_BLOCK.equals(candidate.ruleId())) {
-				continue;
-			}
-			if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule())) {
+			if (matchesErosionRule(world, pos, blockId, candidate.ruleId(), candidate.rule(), biomeHolder)) {
 				return candidate;
 			}
 		}
@@ -380,9 +501,13 @@ public final class EcosystemNaturalErosionManager {
 		BlockPos pos,
 		String sourceBlockId,
 		String ruleId,
-		NaturalErosionConfigManager.ErosionRuleSettings rule
+		NaturalErosionConfigManager.ErosionRuleSettings rule,
+		Holder<Biome> biomeHolder
 	) {
 		if (world == null || pos == null || sourceBlockId == null || sourceBlockId.isBlank() || rule == null || !rule.enabled()) {
+			return false;
+		}
+		if (biomeHolder == null) {
 			return false;
 		}
 		if (!rule.sourceBlocks().contains(sourceBlockId)) {
@@ -398,7 +523,6 @@ public final class EcosystemNaturalErosionManager {
 			return true;
 		}
 
-		Holder<Biome> biomeHolder = world.getBiome(pos);
 		Map<String, Boolean> cachedRules = BIOME_RULE_MATCHES.computeIfAbsent(biomeHolder, ignored -> new ConcurrentHashMap<>());
 		return cachedRules.computeIfAbsent(ruleId, ignored -> matchesEligibleBiome(biomeHolder, eligibleBiomes));
 	}
@@ -556,6 +680,8 @@ public final class EcosystemNaturalErosionManager {
 	private static void loadConfig() {
 		NaturalErosionConfigManager.Settings fallback = NaturalErosionConfigManager.defaults();
 		BIOME_RULE_MATCHES.clear();
+		EROSION_RULE_RESOLUTION_CACHE.clear();
+		SPREAD_STATES_BY_LEVEL.clear();
 		JsonObject defaults = NaturalErosionConfigManager.buildDefaultsJson();
 		try {
 			Path rootDirectory = JSONAPIManager.getOrCreateGlobalSystemDirectory(CONFIG_FOLDER_NAME);

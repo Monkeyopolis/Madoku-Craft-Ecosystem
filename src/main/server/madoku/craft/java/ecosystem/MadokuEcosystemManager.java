@@ -77,6 +77,7 @@ public final class MadokuEcosystemManager {
 
 	/** Resets each ecosystem subsystem and the shared ecosystem runtime. */
 	public static void reset() {
+		EcosystemChunkTickAPIManager.clearAdaptiveCandidateBudget();
 		EcosystemChunkTickAPIManager.unregisterListener(GROWTH_CHUNK_TICK_LISTENER);
 		EcosystemChunkTickAPIManager.unregisterListener(EROSION_CHUNK_TICK_LISTENER);
 		EcosystemChunkTickAPIManager.unregisterListener(DECAY_CHUNK_TICK_LISTENER);
@@ -89,7 +90,9 @@ public final class MadokuEcosystemManager {
 		EcosystemAPIManager.reset();
 	}
 
-	public static void onServerTick(MinecraftServer server) { EcosystemAPIManager.onServerTick(server); }
+	public static void onServerTick(MinecraftServer server) {
+		EcosystemAPIManager.onServerTick(server);
+	}
 	public static void onServerStarted(MinecraftServer server) {
 		registerChunkTickListeners();
 		registerBlockChangeListeners();
