@@ -142,8 +142,8 @@ final class EcosystemAPIManager {
 	static final int CANDIDATE_TREE = 1 << 1;
 	static final int CANDIDATE_CACTUS = 1 << 2;
 	static final int CANDIDATE_GRASS = 1 << 3;
-	static final int CANDIDATE_DECAY = 1 << 4;
-	static final int CANDIDATE_FOLIAGE = 1 << 5;
+	static final int CANDIDATE_FOLIAGE = 1 << 4;
+	static final int CANDIDATE_DECAY = 1 << 5;
 	static final int CANDIDATE_WET = 1 << 6;
 	static final int CANDIDATE_DESERT_FOLIAGE = 1 << 7;
 
