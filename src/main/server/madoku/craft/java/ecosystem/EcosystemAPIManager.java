@@ -128,7 +128,7 @@ final class EcosystemAPIManager {
 	private static final Set<ChunkRefKey> RETAINED_UNLOADED_CHUNK_KEYS = new LinkedHashSet<>();
 	private static final Set<ChunkRefKey> LOADED_PERSISTED_CHUNK_KEYS = new LinkedHashSet<>();
 	private static final Set<ChunkRefKey> DIRTY_CHUNK_KEYS = new LinkedHashSet<>();
-	private static final long SURFACE_SCAN_INTERVAL_TICKS = 10L;
+	private static final long SURFACE_SCAN_INTERVAL_TICKS = 20L;
 	private static final Map<ChunkRefKey, SurfaceScanState> SURFACE_SCAN_STATES = new LinkedHashMap<>();
 	static final Map<String, DirtState> dirtBlocksByKey = new LinkedHashMap<>();
 	private static final Map<String, Map<Long, DirtState>> dirtStatesByLevelAndPosition = new LinkedHashMap<>();
