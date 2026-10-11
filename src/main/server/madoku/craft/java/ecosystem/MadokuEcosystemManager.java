@@ -94,6 +94,7 @@ public final class MadokuEcosystemManager {
 		EcosystemAPIManager.onServerTick(server);
 	}
 	public static void onServerStarted(MinecraftServer server) {
+		EcosystemChunkTickAPIManager.registerActiveChunkBridge();
 		registerChunkTickListeners();
 		registerBlockChangeListeners();
 		EcosystemAPIManager.onServerStarted(server);

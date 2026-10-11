@@ -1,5 +1,8 @@
 package madoku.craft.java.ecosystem;
 
+import madoku.craft.java.core.chunk.ActiveChunkTickAPIManager;
+import madoku.craft.java.core.chunk.ActiveChunkTickEvent;
+import madoku.craft.java.core.chunk.ActiveChunkTickListener;
 import madoku.craft.java.core.runtime.AdaptiveIntervalAPIManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -13,6 +16,9 @@ public final class EcosystemChunkTickAPIManager {
 	private static final long MAX_CANDIDATE_BUDGET_INTERVAL_TICKS = 4L;
 	private static final EcosystemChunkTickProvider UNAVAILABLE_PROVIDER = new EcosystemChunkTickProvider() { };
 	private static volatile EcosystemChunkTickProvider provider = UNAVAILABLE_PROVIDER;
+	private static boolean activeChunkBridgeRegistered;
+	private static final ActiveChunkTickListener ACTIVE_CHUNK_BRIDGE =
+		EcosystemChunkTickAPIManager::dispatchFromCore;
 
 	private EcosystemChunkTickAPIManager() { }
 
@@ -29,10 +35,26 @@ public final class EcosystemChunkTickAPIManager {
 
 	public static void initialize() {
 		provider.initialize();
+		registerActiveChunkBridge();
 	}
 
 	public static void reset() {
+		unregisterActiveChunkBridge();
 		provider.reset();
+	}
+
+	static void registerActiveChunkBridge() {
+		if (!activeChunkBridgeRegistered) {
+			ActiveChunkTickAPIManager.registerListener(ACTIVE_CHUNK_BRIDGE);
+			activeChunkBridgeRegistered = true;
+		}
+	}
+
+	private static void unregisterActiveChunkBridge() {
+		if (activeChunkBridgeRegistered) {
+			ActiveChunkTickAPIManager.unregisterListener(ACTIVE_CHUNK_BRIDGE);
+			activeChunkBridgeRegistered = false;
+		}
 	}
 
 	static void clearAdaptiveCandidateBudget() {
@@ -48,11 +70,6 @@ public final class EcosystemChunkTickAPIManager {
 	}
 
 	public static void dispatch(ServerLevel level, LevelChunk chunk) {
-		dispatch(level, chunk, -1);
-	}
-
-	/** Dispatches an active chunk heartbeat with the random tick speed used by vanilla. */
-	public static void dispatch(ServerLevel level, LevelChunk chunk, int randomTickSpeed) {
 		if (level == null || chunk == null || !EcosystemAPIManager.isEnabled()
 			|| (!EcosystemNaturalGrowthManager.isEnabled()
 				&& !EcosystemNaturalErosionManager.isEnabled()
@@ -113,5 +130,11 @@ public final class EcosystemChunkTickAPIManager {
 			growthCandidateWork,
 			decayCandidateWork
 		));
+	}
+
+	private static void dispatchFromCore(ActiveChunkTickEvent event) {
+		if (event != null) {
+			dispatch(event.level(), event.chunk());
+		}
 	}
 }

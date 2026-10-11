@@ -3,8 +3,7 @@
   "package": "madoku.craft.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
-    "core.LevelEcosystemBlockChangeMixin",
-    "core.ServerLevelEcosystemChunkTickMixin"
+    "core.LevelEcosystemBlockChangeMixin"
   ],
   "injectors": { "defaultRequire": 1 }
 }
