@@ -21,6 +21,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -639,7 +640,7 @@ public final class EcosystemNaturalDecayManager {
 		long currentAbsoluteDayTime,
 		EcosystemChunkTickWorkBudget workBudget
 	) {
-		for (EcosystemAPIManager.TreeDecayCandidateState candidate : candidates.values()) {
+		for (EcosystemAPIManager.TreeDecayCandidateState candidate : new ArrayList<>(candidates.values())) {
 			if (!workBudget.hasRemaining()) {
 				return;
 			}
