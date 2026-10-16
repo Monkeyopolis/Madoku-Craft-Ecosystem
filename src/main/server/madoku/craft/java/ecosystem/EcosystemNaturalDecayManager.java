@@ -1,6 +1,5 @@
 package madoku.craft.java.ecosystem;
 
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import madoku.craft.java.core.json.JSONFormatAPIManager;
@@ -8,6 +7,9 @@ import madoku.craft.java.core.json.JSONAPIManager;
 import madoku.craft.java.core.season.SeasonAPIManager;
 import madoku.craft.java.core.time.TimeAPIManager;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Block;
@@ -179,12 +181,14 @@ public final class EcosystemNaturalDecayManager {
 		targetOwners = treeDecayTargetOwnersByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.leafPos, candidate);
 		targetOwners.put(candidate.targetPos, candidate.leafPos);
-		registerCandidateSchedule(chunkKey, candidate.progressDecayTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredDecayTicks);
-		enqueueCandidateDue(chunkKey, candidate);
+		if (!EcosystemAPIManager.isLoadingPersistedData()) {
+			registerCandidateSchedule(chunkKey, candidate.progressDecayTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredDecayTicks);
+			enqueueCandidateDue(chunkKey, candidate);
+		}
 		return true;
 	}
 
-	static JsonObject createChunkPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey) {
+	static CompoundTag createChunkPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey) {
 		if (chunkKey == null) {
 			return null;
 		}
@@ -193,30 +197,29 @@ public final class EcosystemNaturalDecayManager {
 			return null;
 		}
 
-		JSONFormatAPIManager.ArrayBuilder treeDecayCandidates = JSONFormatAPIManager.array();
+		ListTag treeDecayCandidates = new ListTag();
 		for (EcosystemAPIManager.TreeDecayCandidateState candidate : treeDecayCandidateList) {
 			if (candidate != null) {
-				treeDecayCandidates.add(candidate.toJson());
+				treeDecayCandidates.add(candidate.toNbt());
 			}
 		}
 
-		return EcosystemAPIManager.buildChunkPersistedData(builder -> builder
-			.put("tree-decay-candidates", treeDecayCandidates.build()));
+		return EcosystemAPIManager.buildChunkPersistedData(builder -> builder.put("tree-decay-candidates", treeDecayCandidates));
 	}
 
-	static void applyPersistedData(JsonObject source) {
-		if (source == null || source.isJsonNull()) {
+	static void applyPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey, CompoundTag source) {
+		if (chunkKey == null || source == null || source.isEmpty()) {
 			return;
 		}
 
-		JsonElement treeDecayCandidatesElement = source.get("tree-decay-candidates");
-		if (treeDecayCandidatesElement != null && treeDecayCandidatesElement.isJsonArray()) {
-			for (JsonElement element : treeDecayCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.TreeDecayCandidateState candidate = EcosystemAPIManager.TreeDecayCandidateState.fromJson(element);
+		if (source.get("tree-decay-candidates") instanceof ListTag treeDecayCandidates) {
+			for (Tag element : treeDecayCandidates) {
+				EcosystemAPIManager.TreeDecayCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.TreeDecayCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putTreeDecayCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putTreeDecayCandidate(chunkKey, candidate);
 			}
 		}
 	}
@@ -452,7 +455,7 @@ public final class EcosystemNaturalDecayManager {
 		}
 	}
 
-	private static void refreshCandidateSchedule(EcosystemAPIManager.ChunkRefKey chunkKey) {
+	static void refreshCandidateSchedule(EcosystemAPIManager.ChunkRefKey chunkKey) {
 		if (chunkKey == null) {
 			return;
 		}

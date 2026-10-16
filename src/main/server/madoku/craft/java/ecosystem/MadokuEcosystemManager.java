@@ -9,7 +9,7 @@ public final class MadokuEcosystemManager {
 	private static final DataSaveParticipant DATA_SAVE_PARTICIPANT = new DataSaveParticipant() {
 		@Override public String id() { return "ecosystem"; }
 		@Override public void autosavePersistedData(MinecraftServer server) { MadokuEcosystemManager.autosavePersistedData(server); }
-		@Override public void savePersistedData(MinecraftServer server) { MadokuEcosystemManager.savePersistedData(server); }
+		@Override public void savePersistedData(MinecraftServer server) { EcosystemAPIManager.savePersistedData(server, false); }
 	};
 
 	private static final EcosystemChunkTickListener GROWTH_CHUNK_TICK_LISTENER =
@@ -101,5 +101,5 @@ public final class MadokuEcosystemManager {
 	}
 	public static void loadPersistedData(MinecraftServer server) { EcosystemAPIManager.loadPersistedData(server); }
 	public static void autosavePersistedData(MinecraftServer server) { EcosystemAPIManager.autosavePersistedData(server); }
-	public static void savePersistedData(MinecraftServer server) { EcosystemAPIManager.savePersistedData(server); }
+	public static void savePersistedData(MinecraftServer server) { EcosystemAPIManager.savePersistedData(server, false); }
 }

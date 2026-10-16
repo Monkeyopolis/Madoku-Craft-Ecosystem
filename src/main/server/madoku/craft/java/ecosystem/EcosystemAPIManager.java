@@ -1,14 +1,13 @@
 package madoku.craft.java.ecosystem;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-
 import madoku.craft.java.core.chunk.ChunkAPIManager;
 import madoku.craft.java.core.data.WorldChunkDataAPIManager;
 import madoku.craft.java.core.data.WorldChunkDataKey;
-import madoku.craft.java.core.json.JSONFormatAPIManager;
 import madoku.craft.java.core.time.TimeAPIManager;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -377,10 +376,18 @@ final class EcosystemAPIManager {
 	}
 
 	public static void savePersistedData(MinecraftServer server) {
+		savePersistedData(server, true);
+	}
+
+	static void savePersistedData(MinecraftServer server, boolean materializeAllCandidateProgress) {
 		if (server == null || !isEnabled() || (!isNaturalGrowthEnabled() && !isNaturalErosionEnabled() && !isNaturalDecayEnabled())) {
 			return;
 		}
-		materializeCandidateProgressForSave(server);
+		if (materializeAllCandidateProgress) {
+			materializeCandidateProgressForSave(server);
+		} else {
+			materializeDirtyCandidateProgressForSave(server);
+		}
 
 		Set<ChunkRefKey> currentChunkKeys = collectCurrentChunkKeys();
 		currentChunkKeys.addAll(RETAINED_UNLOADED_CHUNK_KEYS);
@@ -391,7 +398,7 @@ final class EcosystemAPIManager {
 			if (!currentChunkKeys.contains(chunkKey)) {
 				continue;
 			}
-			JsonObject chunkData = createChunkPersistedData(chunkKey);
+			CompoundTag chunkData = createChunkPersistedData(chunkKey);
 			if (chunkData == null) {
 				continue;
 			}
@@ -418,12 +425,19 @@ final class EcosystemAPIManager {
 		ChunkRefKey chunkKey = new ChunkRefKey(levelId(level), chunkX, chunkZ);
 		RETAINED_UNLOADED_CHUNK_KEYS.remove(chunkKey);
 		if (chunkKey.levelId().isBlank() || !LOADED_PERSISTED_CHUNK_KEYS.add(chunkKey)) return;
-		JsonObject source = WorldChunkDataAPIManager.getChunkSystemData(level, chunkX, chunkZ, DATA_SYSTEM_ID);
-		if (source != null && !source.isEmpty()) {
-			source.addProperty(FIELD_LEVEL_ID, chunkKey.levelId());
-			source.addProperty(FIELD_CHUNK_X, chunkX);
-			source.addProperty(FIELD_CHUNK_Z, chunkZ);
-			applyPersistedData(source);
+		CompoundTag source = WorldChunkDataAPIManager.getChunkSystemData(level, chunkX, chunkZ, DATA_SYSTEM_ID);
+		boolean hasData = source != null && !source.isEmpty();
+		if (hasData) {
+			source.putString(FIELD_LEVEL_ID, chunkKey.levelId());
+			source.putInt(FIELD_CHUNK_X, chunkX);
+			source.putInt(FIELD_CHUNK_Z, chunkZ);
+			boolean previousLoadingState = loadingPersistedData;
+			loadingPersistedData = true;
+			try {
+				applyPersistedData(source);
+			} finally {
+				loadingPersistedData = previousLoadingState;
+			}
 		}
 	}
 
@@ -593,6 +607,9 @@ final class EcosystemAPIManager {
 		if (key == null || value == null) {
 			return false;
 		}
+		if (loadingPersistedData) {
+			return putDirtStateDuringLoad(key, value);
+		}
 		DirtState previous = dirtBlocksByKey.get(key);
 		int previousBit = previous == null ? 0 : dirtCandidateBit(previous.mode);
 		int nextBit = dirtCandidateBit(value.mode);
@@ -637,13 +654,31 @@ final class EcosystemAPIManager {
 			markChunkDirty(nextChunkKey);
 		}
 		if (value != null) {
-			EcosystemNaturalGrowthManager.registerCandidateSchedule(
-				nextChunkKey,
-				value.progressGrowthTicks,
-				value.lastProcessedAbsoluteDayTime,
-				value.requiredGrowthTicks
-			);
+			if (!loadingPersistedData) {
+				EcosystemNaturalGrowthManager.registerCandidateSchedule(
+					nextChunkKey,
+					value.progressGrowthTicks,
+					value.lastProcessedAbsoluteDayTime,
+					value.requiredGrowthTicks
+				);
+			}
 		}
+		return true;
+	}
+
+	private static boolean putDirtStateDuringLoad(String key, DirtState value) {
+		if (dirtBlocksByKey.containsKey(key)) {
+			return false;
+		}
+		int candidateBit = dirtCandidateBit(value.mode);
+		if (!addCandidatePositionBit(value.levelId, value.dirtPos, candidateBit)) {
+			return false;
+		}
+		dirtBlocksByKey.put(key, value);
+		putDirtPositionIndex(value);
+		ChunkRefKey chunkKey = chunkRefForPos(value.levelId, value.dirtPos);
+		addChunkIndex(dirtKeysByChunk, chunkKey, key);
+		addColumnIndex(value, key);
 		return true;
 	}
 
@@ -862,7 +897,7 @@ final class EcosystemAPIManager {
 		}
 
 		EcosystemNaturalDecayManager.materializeCandidateProgressForSave(level, chunkKey);
-		JsonObject chunkData = createChunkPersistedData(chunkKey);
+		CompoundTag chunkData = createChunkPersistedData(chunkKey);
 		WorldChunkDataKey dataKey = new WorldChunkDataKey(
 			chunkKey.levelId(),
 			chunkKey.chunkX(),
@@ -985,6 +1020,10 @@ final class EcosystemAPIManager {
 		}
 		DIRTY_CHUNK_KEYS.add(chunkKey);
 		dirty = true;
+	}
+
+	static boolean isLoadingPersistedData() {
+		return loadingPersistedData;
 	}
 
 	static void markChunkDirty(ServerLevel level, int chunkX, int chunkZ) {
@@ -1241,8 +1280,8 @@ final class EcosystemAPIManager {
 		return EcosystemNaturalGrowthManager.resolveSurfaceDirtGrowthBlock(world, pos);
 	}
 
-	private static ChunkRefKey applyPersistedData(JsonObject source) {
-		if (source == null || source.isJsonNull()) {
+	private static ChunkRefKey applyPersistedData(CompoundTag source) {
+		if (source == null || source.isEmpty()) {
 			return null;
 		}
 
@@ -1258,62 +1297,63 @@ final class EcosystemAPIManager {
 
 		ChunkRefKey chunkKey = new ChunkRefKey(levelId, chunkX, chunkZ);
 
-		JsonElement dirtBlocksElement = source.get(FIELD_GROUND_BLOCKS);
-		if (dirtBlocksElement != null && dirtBlocksElement.isJsonArray()) {
-			for (JsonElement element : dirtBlocksElement.getAsJsonArray()) {
-				DirtState dirt = DirtState.fromJson(element);
+		if (source.get(FIELD_GROUND_BLOCKS) instanceof ListTag dirtBlocks) {
+			for (Tag element : dirtBlocks) {
+				DirtState dirt = element instanceof CompoundTag compound ? DirtState.fromNbt(compound) : null;
 				if (dirt == null) {
 					continue;
 				}
 				putDirtState(dirt.key(), dirt);
 			}
 		}
-		EcosystemNaturalGrowthManager.applyPersistedData(source);
-		EcosystemNaturalDecayManager.applyPersistedData(source);
+		EcosystemNaturalGrowthManager.applyPersistedData(chunkKey, source);
+		EcosystemNaturalDecayManager.applyPersistedData(chunkKey, source);
+		EcosystemNaturalGrowthManager.refreshCandidateSchedule(chunkKey);
+		EcosystemNaturalDecayManager.refreshCandidateSchedule(chunkKey);
 
 		PERSISTED_CHUNK_KEYS.add(chunkKey);
 		return chunkKey;
 	}
 
-	private static JsonObject createChunkPersistedData(ChunkRefKey chunkKey) {
+	private static CompoundTag createChunkPersistedData(ChunkRefKey chunkKey) {
 		if (chunkKey == null) {
 			return null;
 		}
 
-		JSONFormatAPIManager.ArrayBuilder dirtBlocks = JSONFormatAPIManager.array();
+		ListTag dirtBlocks = new ListTag();
 		Set<String> dirtKeys = dirtKeysByChunk.get(chunkKey);
 		if (dirtKeys != null) {
 			for (String key : dirtKeys) {
 				DirtState dirt = dirtBlocksByKey.get(key);
 				if (dirt != null) {
-					dirtBlocks.add(dirt.toJson());
+					dirtBlocks.add(dirt.toNbt());
 				}
 			}
 		}
 
-		JsonObject growthData = EcosystemNaturalGrowthManager.createChunkPersistedData(chunkKey);
-		JsonObject decayData = EcosystemNaturalDecayManager.createChunkPersistedData(chunkKey);
+		CompoundTag growthData = EcosystemNaturalGrowthManager.createChunkPersistedData(chunkKey);
+		CompoundTag decayData = EcosystemNaturalDecayManager.createChunkPersistedData(chunkKey);
 		boolean hasData = (dirtKeys != null && !dirtKeys.isEmpty()) || growthData != null || decayData != null;
 		if (!hasData) {
 			return null;
 		}
 
-		JSONFormatAPIManager.ObjectBuilder builder = JSONFormatAPIManager.object()
-			.put(FIELD_LEVEL_ID, chunkKey.levelId())
-			.put(FIELD_CHUNK_X, chunkKey.chunkX())
-			.put(FIELD_CHUNK_Z, chunkKey.chunkZ())
-			.put(FIELD_GROUND_BLOCKS, dirtBlocks.build());
+		CompoundTag builder = new CompoundTag();
+		builder.putString(FIELD_LEVEL_ID, chunkKey.levelId());
+		builder.putInt(FIELD_CHUNK_X, chunkKey.chunkX());
+		builder.putInt(FIELD_CHUNK_Z, chunkKey.chunkZ());
+		builder.put(FIELD_GROUND_BLOCKS, dirtBlocks);
 		if (growthData != null) {
-			builder.put(FIELD_TREE_CANDIDATES, growthData.get(FIELD_TREE_CANDIDATES))
-				.put(FIELD_CACTUS_CANDIDATES, growthData.get(FIELD_CACTUS_CANDIDATES))
-				.put(FIELD_GRASS_CANDIDATES, growthData.get(FIELD_GRASS_CANDIDATES))
-				.put(FIELD_DESERT_FOLIAGE_GROWTH_CANDIDATES, growthData.get(FIELD_DESERT_FOLIAGE_GROWTH_CANDIDATES))
-				.put(FIELD_FOLIAGE_CANDIDATES, growthData.get(FIELD_FOLIAGE_CANDIDATES));
+			builder.put(FIELD_TREE_CANDIDATES, growthData.get(FIELD_TREE_CANDIDATES));
+			builder.put(FIELD_CACTUS_CANDIDATES, growthData.get(FIELD_CACTUS_CANDIDATES));
+			builder.put(FIELD_GRASS_CANDIDATES, growthData.get(FIELD_GRASS_CANDIDATES));
+			builder.put(FIELD_DESERT_FOLIAGE_GROWTH_CANDIDATES, growthData.get(FIELD_DESERT_FOLIAGE_GROWTH_CANDIDATES));
+			builder.put(FIELD_FOLIAGE_CANDIDATES, growthData.get(FIELD_FOLIAGE_CANDIDATES));
 		}
 		if (decayData != null) {
 			builder.put(FIELD_TREE_DECAY_CANDIDATES, decayData.get(FIELD_TREE_DECAY_CANDIDATES));
 		}
-		return builder.build();
+		return builder;
 	}
 
 	private static void materializeCandidateProgressForSave(MinecraftServer server) {
@@ -1326,13 +1366,33 @@ final class EcosystemAPIManager {
 		}
 	}
 
-	static JsonObject buildChunkPersistedData(Consumer<JSONFormatAPIManager.ObjectBuilder> writer) {
+	private static void materializeDirtyCandidateProgressForSave(MinecraftServer server) {
+		Set<ChunkRefKey> dirtyChunkKeys = collectDirtyChunkKeys();
+		if (server == null || dirtyChunkKeys.isEmpty()) {
+			return;
+		}
+		for (ServerLevel level : server.getAllLevels()) {
+			String currentLevelId = levelId(level);
+			Set<ChunkRefKey> levelDirtyChunkKeys = new LinkedHashSet<>();
+			for (ChunkRefKey chunkKey : dirtyChunkKeys) {
+				if (chunkKey != null && currentLevelId.equals(chunkKey.levelId())) {
+					levelDirtyChunkKeys.add(chunkKey);
+				}
+			}
+			EcosystemNaturalGrowthManager.materializeCandidateProgressForSave(level, levelDirtyChunkKeys);
+			for (ChunkRefKey chunkKey : levelDirtyChunkKeys) {
+				EcosystemNaturalDecayManager.materializeCandidateProgressForSave(level, chunkKey);
+			}
+		}
+	}
+
+	static CompoundTag buildChunkPersistedData(Consumer<CompoundTag> writer) {
 		if (writer == null) {
 			return null;
 		}
-		JSONFormatAPIManager.ObjectBuilder builder = JSONFormatAPIManager.object();
+		CompoundTag builder = new CompoundTag();
 		writer.accept(builder);
-		return builder.build();
+		return builder;
 	}
 
 	private static Set<ChunkRefKey> collectCurrentChunkKeys() {
@@ -1343,50 +1403,22 @@ final class EcosystemAPIManager {
 		return keys;
 	}
 
-	private static long getLong(JsonObject object, String key, long fallback) {
-		if (object == null || key == null || key.isBlank()) {
-			return fallback;
-		}
-		JsonElement element = object.get(key);
-		if (element == null || element.isJsonNull()) {
-			return fallback;
-		}
-		try {
-			return element.getAsLong();
-		} catch (UnsupportedOperationException | IllegalStateException | NumberFormatException ignored) {
-			return fallback;
-		}
+	private static long getLong(CompoundTag object, String key, long fallback) {
+		if (object == null || key == null || key.isBlank()) return fallback;
+		try { return object.getLong(key).orElse(fallback); }
+		catch (RuntimeException ignored) { return fallback; }
 	}
 
-	private static double getDouble(JsonObject object, String key, double fallback) {
-		if (object == null || key == null || key.isBlank()) {
-			return fallback;
-		}
-		JsonElement element = object.get(key);
-		if (element == null || element.isJsonNull()) {
-			return fallback;
-		}
-		try {
-			return element.getAsDouble();
-		} catch (UnsupportedOperationException | IllegalStateException | NumberFormatException ignored) {
-			return fallback;
-		}
+	private static double getDouble(CompoundTag object, String key, double fallback) {
+		if (object == null || key == null || key.isBlank()) return fallback;
+		try { return object.getDouble(key).orElse(fallback); }
+		catch (RuntimeException ignored) { return fallback; }
 	}
 
-	private static String getString(JsonObject object, String key, String fallback) {
-		if (object == null || key == null || key.isBlank()) {
-			return fallback;
-		}
-		JsonElement element = object.get(key);
-		if (element == null || element.isJsonNull()) {
-			return fallback;
-		}
-		try {
-			String value = element.getAsString();
-			return value == null ? fallback : value;
-		} catch (UnsupportedOperationException | IllegalStateException ignored) {
-			return fallback;
-		}
+	private static String getString(CompoundTag object, String key, String fallback) {
+		if (object == null || key == null || key.isBlank()) return fallback;
+		try { return object.getString(key).orElse(fallback); }
+		catch (RuntimeException ignored) { return fallback; }
 	}
 
 	record ChunkRefKey(String levelId, int chunkX, int chunkZ) {
@@ -1436,33 +1468,22 @@ final class EcosystemAPIManager {
 			this.startedAbsoluteDayTime = deriveCandidateStartTime(this.lastProcessedAbsoluteDayTime, this.progressGrowthTicks);
 		}
 
-		JsonObject toJson() {
-			return JSONFormatAPIManager.object()
-				.put(FIELD_LEVEL_ID, levelId)
-				.put(FIELD_CHUNK_X, chunkX)
-				.put(FIELD_CHUNK_Z, chunkZ)
-				.put(FIELD_CACTUS_GROUND_POS, groundPos)
-				.put(FIELD_INITIAL_SEASON_ID, initialSeasonId)
-				.put(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks)
-				.put(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks)
-				.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-				.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-				.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putInt(FIELD_CHUNK_X, chunkX);
+			data.putInt(FIELD_CHUNK_Z, chunkZ);
+			data.putLong(FIELD_CACTUS_GROUND_POS, groundPos);
+			data.putString(FIELD_INITIAL_SEASON_ID, initialSeasonId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		static CactusCandidateState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
-				return null;
-			}
-
-			JsonObject source = element.getAsJsonObject();
-			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
-			if (levelId.isEmpty()) {
-				return null;
-			}
-			int chunkX = (int) getLong(source, FIELD_CHUNK_X, Integer.MIN_VALUE);
-			int chunkZ = (int) getLong(source, FIELD_CHUNK_Z, Integer.MIN_VALUE);
-			if (chunkX == Integer.MIN_VALUE || chunkZ == Integer.MIN_VALUE) {
+		static CactusCandidateState fromNbt(CompoundTag source, ChunkRefKey chunkKey) {
+			if (source == null || chunkKey == null) {
 				return null;
 			}
 			long groundPos = getLong(source, FIELD_CACTUS_GROUND_POS, Long.MIN_VALUE);
@@ -1478,9 +1499,9 @@ final class EcosystemAPIManager {
 			double progressGrowthTicks = getDouble(source, FIELD_PROGRESS_GROWTH_TICKS, 0.0d);
 			long lastProcessedAbsoluteDayTime = getLong(source, FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, 0L);
 			CactusCandidateState result = new CactusCandidateState(
-				levelId,
-				chunkX,
-				chunkZ,
+				chunkKey.levelId(),
+				chunkKey.chunkX(),
+				chunkKey.chunkZ(),
 				groundPos,
 				initialSeasonId,
 				requiredGrowthTicks,
@@ -1525,33 +1546,22 @@ final class EcosystemAPIManager {
 			this.startedAbsoluteDayTime = deriveCandidateStartTime(this.lastProcessedAbsoluteDayTime, this.progressGrowthTicks);
 		}
 
-		JsonObject toJson() {
-			return JSONFormatAPIManager.object()
-				.put(FIELD_LEVEL_ID, levelId)
-				.put(FIELD_CHUNK_X, chunkX)
-				.put(FIELD_CHUNK_Z, chunkZ)
-				.put(FIELD_GRASS_GROUND_POS, groundPos)
-				.put(FIELD_INITIAL_SEASON_ID, initialSeasonId)
-				.put(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks)
-				.put(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks)
-				.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-				.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-				.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putInt(FIELD_CHUNK_X, chunkX);
+			data.putInt(FIELD_CHUNK_Z, chunkZ);
+			data.putLong(FIELD_GRASS_GROUND_POS, groundPos);
+			data.putString(FIELD_INITIAL_SEASON_ID, initialSeasonId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		static GrassCandidateState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
-				return null;
-			}
-
-			JsonObject source = element.getAsJsonObject();
-			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
-			if (levelId.isEmpty()) {
-				return null;
-			}
-			int chunkX = (int) getLong(source, FIELD_CHUNK_X, Integer.MIN_VALUE);
-			int chunkZ = (int) getLong(source, FIELD_CHUNK_Z, Integer.MIN_VALUE);
-			if (chunkX == Integer.MIN_VALUE || chunkZ == Integer.MIN_VALUE) {
+		static GrassCandidateState fromNbt(CompoundTag source, ChunkRefKey chunkKey) {
+			if (source == null || chunkKey == null) {
 				return null;
 			}
 			long groundPos = getLong(source, FIELD_GRASS_GROUND_POS, Long.MIN_VALUE);
@@ -1567,9 +1577,9 @@ final class EcosystemAPIManager {
 			double progressGrowthTicks = getDouble(source, FIELD_PROGRESS_GROWTH_TICKS, 0.0d);
 			long lastProcessedAbsoluteDayTime = getLong(source, FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, 0L);
 			GrassCandidateState result = new GrassCandidateState(
-				levelId,
-				chunkX,
-				chunkZ,
+				chunkKey.levelId(),
+				chunkKey.chunkX(),
+				chunkKey.chunkZ(),
 				groundPos,
 				initialSeasonId,
 				requiredGrowthTicks,
@@ -1618,34 +1628,23 @@ final class EcosystemAPIManager {
 			this.startedAbsoluteDayTime = deriveCandidateStartTime(this.lastProcessedAbsoluteDayTime, this.progressGrowthTicks);
 		}
 
-		JsonObject toJson() {
-			return JSONFormatAPIManager.object()
-				.put(FIELD_LEVEL_ID, levelId)
-				.put(FIELD_CHUNK_X, chunkX)
-				.put(FIELD_CHUNK_Z, chunkZ)
-				.put(FIELD_FOLIAGE_GROUND_POS, groundPos)
-				.put(FIELD_FOLIAGE_TYPE, foliageType)
-				.put(FIELD_INITIAL_SEASON_ID, initialSeasonId)
-				.put(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks)
-				.put(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks)
-				.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-				.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-				.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putInt(FIELD_CHUNK_X, chunkX);
+			data.putInt(FIELD_CHUNK_Z, chunkZ);
+			data.putLong(FIELD_FOLIAGE_GROUND_POS, groundPos);
+			data.putString(FIELD_FOLIAGE_TYPE, foliageType);
+			data.putString(FIELD_INITIAL_SEASON_ID, initialSeasonId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		static FoliageCandidateState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
-				return null;
-			}
-
-			JsonObject source = element.getAsJsonObject();
-			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
-			if (levelId.isEmpty()) {
-				return null;
-			}
-			int chunkX = (int) getLong(source, FIELD_CHUNK_X, Integer.MIN_VALUE);
-			int chunkZ = (int) getLong(source, FIELD_CHUNK_Z, Integer.MIN_VALUE);
-			if (chunkX == Integer.MIN_VALUE || chunkZ == Integer.MIN_VALUE) {
+		static FoliageCandidateState fromNbt(CompoundTag source, ChunkRefKey chunkKey) {
+			if (source == null || chunkKey == null) {
 				return null;
 			}
 				long groundPos = getLong(source, FIELD_FOLIAGE_GROUND_POS, Long.MIN_VALUE);
@@ -1662,9 +1661,9 @@ final class EcosystemAPIManager {
 				double progressGrowthTicks = getDouble(source, FIELD_PROGRESS_GROWTH_TICKS, 0.0d);
 				long lastProcessedAbsoluteDayTime = getLong(source, FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, 0L);
 				FoliageCandidateState result = new FoliageCandidateState(
-					levelId,
-					chunkX,
-					chunkZ,
+					chunkKey.levelId(),
+					chunkKey.chunkX(),
+					chunkKey.chunkZ(),
 					groundPos,
 					foliageType,
 					initialSeasonId,
@@ -1713,34 +1712,23 @@ final class EcosystemAPIManager {
 			this.startedAbsoluteDayTime = deriveCandidateStartTime(this.lastProcessedAbsoluteDayTime, this.progressDecayTicks);
 		}
 
-			JsonObject toJson() {
-				return JSONFormatAPIManager.object()
-					.put(FIELD_LEVEL_ID, levelId)
-					.put(FIELD_CHUNK_X, chunkX)
-					.put(FIELD_CHUNK_Z, chunkZ)
-					.put(FIELD_TREE_DECAY_SOURCE_POS, leafPos)
-					.put(FIELD_TREE_DECAY_TARGET_POS, targetPos)
-					.put(FIELD_INITIAL_SEASON_ID, initialSeasonId)
-					.put(FIELD_REQUIRED_GROWTH_TICKS, requiredDecayTicks)
-					.put(FIELD_PROGRESS_GROWTH_TICKS, progressDecayTicks)
-					.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-					.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-					.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putInt(FIELD_CHUNK_X, chunkX);
+			data.putInt(FIELD_CHUNK_Z, chunkZ);
+			data.putLong(FIELD_TREE_DECAY_SOURCE_POS, leafPos);
+			data.putLong(FIELD_TREE_DECAY_TARGET_POS, targetPos);
+			data.putString(FIELD_INITIAL_SEASON_ID, initialSeasonId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredDecayTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressDecayTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		static TreeDecayCandidateState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
-				return null;
-			}
-
-			JsonObject source = element.getAsJsonObject();
-			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
-			if (levelId.isEmpty()) {
-				return null;
-			}
-			int chunkX = (int) getLong(source, FIELD_CHUNK_X, Integer.MIN_VALUE);
-			int chunkZ = (int) getLong(source, FIELD_CHUNK_Z, Integer.MIN_VALUE);
-			if (chunkX == Integer.MIN_VALUE || chunkZ == Integer.MIN_VALUE) {
+		static TreeDecayCandidateState fromNbt(CompoundTag source, ChunkRefKey chunkKey) {
+			if (source == null || chunkKey == null) {
 				return null;
 			}
 			long targetPos = getLong(source, FIELD_TREE_DECAY_TARGET_POS, Long.MIN_VALUE);
@@ -1757,9 +1745,9 @@ final class EcosystemAPIManager {
 			double progressDecayTicks = getDouble(source, FIELD_PROGRESS_GROWTH_TICKS, 0.0d);
 			long lastProcessedAbsoluteDayTime = getLong(source, FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, 0L);
 			TreeDecayCandidateState result = new TreeDecayCandidateState(
-				levelId,
-				chunkX,
-				chunkZ,
+				chunkKey.levelId(),
+				chunkKey.chunkX(),
+				chunkKey.chunkZ(),
 				leafPos,
 				targetPos,
 				initialSeasonId,
@@ -1826,34 +1814,23 @@ final class EcosystemAPIManager {
 			this.startedAbsoluteDayTime = deriveCandidateStartTime(this.lastProcessedAbsoluteDayTime, this.progressGrowthTicks);
 		}
 
-		JsonObject toJson() {
-			return JSONFormatAPIManager.object()
-				.put(FIELD_LEVEL_ID, levelId)
-				.put(FIELD_CHUNK_X, chunkX)
-				.put(FIELD_CHUNK_Z, chunkZ)
-				.put(FIELD_TREE_GROUND_POS, groundPos)
-				.put(FIELD_TREE_TYPE, treeType)
-				.put(FIELD_INITIAL_SEASON_ID, initialSeasonId)
-				.put(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks)
-				.put(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks)
-				.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-				.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-				.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putInt(FIELD_CHUNK_X, chunkX);
+			data.putInt(FIELD_CHUNK_Z, chunkZ);
+			data.putLong(FIELD_TREE_GROUND_POS, groundPos);
+			data.putString(FIELD_TREE_TYPE, treeType);
+			data.putString(FIELD_INITIAL_SEASON_ID, initialSeasonId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		static TreeCandidateState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
-				return null;
-			}
-
-			JsonObject source = element.getAsJsonObject();
-			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
-			if (levelId.isEmpty()) {
-				return null;
-			}
-			int chunkX = (int) getLong(source, FIELD_CHUNK_X, Integer.MIN_VALUE);
-			int chunkZ = (int) getLong(source, FIELD_CHUNK_Z, Integer.MIN_VALUE);
-			if (chunkX == Integer.MIN_VALUE || chunkZ == Integer.MIN_VALUE) {
+		static TreeCandidateState fromNbt(CompoundTag source, ChunkRefKey chunkKey) {
+			if (source == null || chunkKey == null) {
 				return null;
 			}
 			long groundPos = getLong(source, FIELD_TREE_GROUND_POS, Long.MIN_VALUE);
@@ -1870,9 +1847,9 @@ final class EcosystemAPIManager {
 			double progressGrowthTicks = getDouble(source, FIELD_PROGRESS_GROWTH_TICKS, 0.0d);
 			long lastProcessedAbsoluteDayTime = getLong(source, FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, 0L);
 			TreeCandidateState result = new TreeCandidateState(
-				levelId,
-				chunkX,
-				chunkZ,
+				chunkKey.levelId(),
+				chunkKey.chunkX(),
+				chunkKey.chunkZ(),
 				groundPos,
 				treeType,
 				initialSeasonId,
@@ -1919,24 +1896,23 @@ final class EcosystemAPIManager {
 			return levelId + "|" + dirtPos;
 		}
 
-		JsonObject toJson() {
-			return JSONFormatAPIManager.object()
-				.put(FIELD_LEVEL_ID, levelId)
-				.put(FIELD_BLOCK_POS, dirtPos)
-				.put(FIELD_MODE, mode)
-				.put(FIELD_EROSION_RULE_ID, erosionRuleId)
-				.put(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks)
-				.put(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks)
-				.put(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime)
-				.put(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime)
-				.build();
+		CompoundTag toNbt() {
+			CompoundTag data = new CompoundTag();
+			data.putString(FIELD_LEVEL_ID, levelId);
+			data.putLong(FIELD_BLOCK_POS, dirtPos);
+			data.putString(FIELD_MODE, mode);
+			data.putString(FIELD_EROSION_RULE_ID, erosionRuleId);
+			data.putDouble(FIELD_REQUIRED_GROWTH_TICKS, requiredGrowthTicks);
+			data.putDouble(FIELD_PROGRESS_GROWTH_TICKS, progressGrowthTicks);
+			data.putLong(FIELD_LAST_PROCESSED_ABSOLUTE_DAY_TIME, lastProcessedAbsoluteDayTime);
+			data.putLong(FIELD_STARTED_ABSOLUTE_DAY_TIME, startedAbsoluteDayTime);
+			return data;
 		}
 
-		private static DirtState fromJson(JsonElement element) {
-			if (element == null || !element.isJsonObject()) {
+		private static DirtState fromNbt(CompoundTag source) {
+			if (source == null) {
 				return null;
 			}
-			JsonObject source = element.getAsJsonObject();
 			String levelId = getString(source, FIELD_LEVEL_ID, "").trim();
 			if (levelId.isEmpty()) {
 				return null;

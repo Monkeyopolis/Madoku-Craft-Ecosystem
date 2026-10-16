@@ -1,6 +1,5 @@
 package madoku.craft.java.ecosystem;
 
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import madoku.craft.java.core.json.JSONFormatAPIManager;
@@ -8,6 +7,9 @@ import madoku.craft.java.core.json.JSONAPIManager;
 import madoku.craft.java.core.season.SeasonAPIManager;
 import madoku.craft.java.core.time.TimeAPIManager;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.core.HolderGetter;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
@@ -121,10 +123,21 @@ public final class EcosystemNaturalGrowthManager {
 			return;
 		}
 
-		String currentLevelId = EcosystemAPIManager.levelId(world);
-		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
 		Set<EcosystemAPIManager.ChunkRefKey> chunkKeys = collectTrackedChunkKeys();
 		chunkKeys.addAll(EcosystemAPIManager.dirtKeysByChunk.keySet());
+		materializeCandidateProgressForSave(world, chunkKeys);
+	}
+
+	static void materializeCandidateProgressForSave(
+		ServerLevel world,
+		Set<EcosystemAPIManager.ChunkRefKey> chunkKeys
+	) {
+		if (world == null || chunkKeys == null || chunkKeys.isEmpty()) {
+			return;
+		}
+
+		String currentLevelId = EcosystemAPIManager.levelId(world);
+		long currentAbsoluteDayTime = EcosystemAPIManager.resolveCachedAbsoluteDayTime(world);
 		for (EcosystemAPIManager.ChunkRefKey chunkKey : chunkKeys) {
 			if (chunkKey == null || !currentLevelId.equals(chunkKey.levelId())) {
 				continue;
@@ -338,6 +351,17 @@ public final class EcosystemNaturalGrowthManager {
 		return chunkKey == null ? List.of() : foliageCandidatesByChunk.getOrDefault(chunkKey, Map.of()).values();
 	}
 
+	private static void registerCandidateScheduleIfActive(
+		EcosystemAPIManager.ChunkRefKey chunkKey,
+		double progressGrowthTicks,
+		long lastProcessedAbsoluteDayTime,
+		double requiredGrowthTicks
+	) {
+		if (!EcosystemAPIManager.isLoadingPersistedData()) {
+			registerCandidateSchedule(chunkKey, progressGrowthTicks, lastProcessedAbsoluteDayTime, requiredGrowthTicks);
+		}
+	}
+
 	static EcosystemAPIManager.TreeCandidateState putTreeCandidate(
 		EcosystemAPIManager.ChunkRefKey chunkKey,
 		EcosystemAPIManager.TreeCandidateState candidate
@@ -352,7 +376,7 @@ public final class EcosystemNaturalGrowthManager {
 		if (previous != null && previous.groundPos != candidate.groundPos) {
 			EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_TREE);
 		}
-		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
+		registerCandidateScheduleIfActive(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 		return previous;
 	}
 
@@ -370,7 +394,7 @@ public final class EcosystemNaturalGrowthManager {
 		if (previous != null && previous.groundPos != candidate.groundPos) {
 			EcosystemAPIManager.removeCandidatePositionBit(previous.levelId, previous.groundPos, EcosystemAPIManager.CANDIDATE_CACTUS);
 		}
-		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
+		registerCandidateScheduleIfActive(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 		return previous;
 	}
 
@@ -388,7 +412,7 @@ public final class EcosystemNaturalGrowthManager {
 		}
 		candidates = grassCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
+		registerCandidateScheduleIfActive(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
 	static void putDesertFoliageGrowthCandidate(
@@ -408,7 +432,7 @@ public final class EcosystemNaturalGrowthManager {
 		}
 		candidates = desertFoliageGrowthCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
+		registerCandidateScheduleIfActive(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
 	static void putFoliageCandidate(EcosystemAPIManager.ChunkRefKey chunkKey, EcosystemAPIManager.FoliageCandidateState candidate) {
@@ -426,7 +450,7 @@ public final class EcosystemNaturalGrowthManager {
 		}
 		candidates = foliageCandidatesByChunk.computeIfAbsent(chunkKey, ignored -> new LinkedHashMap<>());
 		candidates.put(candidate.groundPos, candidate);
-		registerCandidateSchedule(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
+		registerCandidateScheduleIfActive(chunkKey, candidate.progressGrowthTicks, candidate.lastProcessedAbsoluteDayTime, candidate.requiredGrowthTicks);
 	}
 
 	static EcosystemAPIManager.TreeCandidateState removeTreeCandidate(EcosystemAPIManager.ChunkRefKey chunkKey) {
@@ -453,49 +477,49 @@ public final class EcosystemNaturalGrowthManager {
 		return removed;
 	}
 
-	static JsonObject createChunkPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey) {
+	static CompoundTag createChunkPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey) {
 		if (chunkKey == null) {
 			return null;
 		}
 
-		JSONFormatAPIManager.ArrayBuilder treeCandidates = JSONFormatAPIManager.array();
+		ListTag treeCandidates = new ListTag();
 		EcosystemAPIManager.TreeCandidateState treeCandidate = getTreeCandidate(chunkKey);
 		if (treeCandidate != null) {
-			treeCandidates.add(treeCandidate.toJson());
+			treeCandidates.add(treeCandidate.toNbt());
 		}
 
-		JSONFormatAPIManager.ArrayBuilder cactusCandidates = JSONFormatAPIManager.array();
+		ListTag cactusCandidates = new ListTag();
 		EcosystemAPIManager.CactusCandidateState cactusCandidate = getCactusCandidate(chunkKey);
 		if (cactusCandidate != null) {
-			cactusCandidates.add(cactusCandidate.toJson());
+			cactusCandidates.add(cactusCandidate.toNbt());
 		}
 
-		JSONFormatAPIManager.ArrayBuilder grassCandidates = JSONFormatAPIManager.array();
+		ListTag grassCandidates = new ListTag();
 		Collection<EcosystemAPIManager.GrassCandidateState> grassCandidateList = getGrassCandidates(chunkKey);
 		if (grassCandidateList != null) {
 			for (EcosystemAPIManager.GrassCandidateState candidate : grassCandidateList) {
 				if (candidate != null) {
-					grassCandidates.add(candidate.toJson());
+					grassCandidates.add(candidate.toNbt());
 				}
 			}
 		}
 
-		JSONFormatAPIManager.ArrayBuilder desertFoliageGrowthCandidates = JSONFormatAPIManager.array();
+		ListTag desertFoliageGrowthCandidates = new ListTag();
 		Collection<EcosystemAPIManager.GrassCandidateState> desertFoliageGrowthCandidateList = getDesertFoliageGrowthCandidates(chunkKey);
 		if (desertFoliageGrowthCandidateList != null) {
 			for (EcosystemAPIManager.GrassCandidateState candidate : desertFoliageGrowthCandidateList) {
 				if (candidate != null) {
-					desertFoliageGrowthCandidates.add(candidate.toJson());
+					desertFoliageGrowthCandidates.add(candidate.toNbt());
 				}
 			}
 		}
 
-		JSONFormatAPIManager.ArrayBuilder foliageCandidates = JSONFormatAPIManager.array();
+		ListTag foliageCandidates = new ListTag();
 		Collection<EcosystemAPIManager.FoliageCandidateState> foliageCandidateList = getFoliageCandidates(chunkKey);
 		if (foliageCandidateList != null) {
 			for (EcosystemAPIManager.FoliageCandidateState candidate : foliageCandidateList) {
 				if (candidate != null) {
-					foliageCandidates.add(candidate.toJson());
+					foliageCandidates.add(candidate.toNbt());
 				}
 			}
 		}
@@ -509,71 +533,72 @@ public final class EcosystemNaturalGrowthManager {
 			return null;
 		}
 
-		return EcosystemAPIManager.buildChunkPersistedData(builder -> builder
-			.put("tree-candidates", treeCandidates.build())
-			.put("cactus-candidates", cactusCandidates.build())
-			.put("grass-candidates", grassCandidates.build())
-			.put("desert-foliage-growth-candidates", desertFoliageGrowthCandidates.build())
-			.put("foliage-candidates", foliageCandidates.build()));
+		return EcosystemAPIManager.buildChunkPersistedData(builder -> {
+			builder.put("tree-candidates", treeCandidates);
+			builder.put("cactus-candidates", cactusCandidates);
+			builder.put("grass-candidates", grassCandidates);
+			builder.put("desert-foliage-growth-candidates", desertFoliageGrowthCandidates);
+			builder.put("foliage-candidates", foliageCandidates);
+		});
 	}
 
-	static void applyPersistedData(JsonObject source) {
-		if (source == null || source.isJsonNull()) {
+	static void applyPersistedData(EcosystemAPIManager.ChunkRefKey chunkKey, CompoundTag source) {
+		if (chunkKey == null || source == null || source.isEmpty()) {
 			return;
 		}
 
-		JsonElement treeCandidatesElement = source.get("tree-candidates");
-		if (treeCandidatesElement != null && treeCandidatesElement.isJsonArray()) {
-			for (JsonElement element : treeCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.TreeCandidateState candidate = EcosystemAPIManager.TreeCandidateState.fromJson(element);
+		if (source.get("tree-candidates") instanceof ListTag treeCandidates) {
+			for (Tag element : treeCandidates) {
+				EcosystemAPIManager.TreeCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.TreeCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putTreeCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putTreeCandidate(chunkKey, candidate);
 			}
 		}
 
-		JsonElement cactusCandidatesElement = source.get("cactus-candidates");
-		if (cactusCandidatesElement != null && cactusCandidatesElement.isJsonArray()) {
-			for (JsonElement element : cactusCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.CactusCandidateState candidate = EcosystemAPIManager.CactusCandidateState.fromJson(element);
+		if (source.get("cactus-candidates") instanceof ListTag cactusCandidates) {
+			for (Tag element : cactusCandidates) {
+				EcosystemAPIManager.CactusCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.CactusCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putCactusCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putCactusCandidate(chunkKey, candidate);
 			}
 		}
 
-		JsonElement grassCandidatesElement = source.get("grass-candidates");
-		if (grassCandidatesElement != null && grassCandidatesElement.isJsonArray()) {
-			for (JsonElement element : grassCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.GrassCandidateState candidate = EcosystemAPIManager.GrassCandidateState.fromJson(element);
+		if (source.get("grass-candidates") instanceof ListTag grassCandidates) {
+			for (Tag element : grassCandidates) {
+				EcosystemAPIManager.GrassCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.GrassCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putGrassCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putGrassCandidate(chunkKey, candidate);
 			}
 		}
 
-		JsonElement desertFoliageGrowthCandidatesElement = source.get("desert-foliage-growth-candidates");
-		if (desertFoliageGrowthCandidatesElement != null && desertFoliageGrowthCandidatesElement.isJsonArray()) {
-			for (JsonElement element : desertFoliageGrowthCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.GrassCandidateState candidate = EcosystemAPIManager.GrassCandidateState.fromJson(element);
+		if (source.get("desert-foliage-growth-candidates") instanceof ListTag desertFoliageGrowthCandidates) {
+			for (Tag element : desertFoliageGrowthCandidates) {
+				EcosystemAPIManager.GrassCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.GrassCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putDesertFoliageGrowthCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putDesertFoliageGrowthCandidate(chunkKey, candidate);
 			}
 		}
 
-		JsonElement foliageCandidatesElement = source.get("foliage-candidates");
-		if (foliageCandidatesElement != null && foliageCandidatesElement.isJsonArray()) {
-			for (JsonElement element : foliageCandidatesElement.getAsJsonArray()) {
-				EcosystemAPIManager.FoliageCandidateState candidate = EcosystemAPIManager.FoliageCandidateState.fromJson(element);
+		if (source.get("foliage-candidates") instanceof ListTag foliageCandidates) {
+			for (Tag element : foliageCandidates) {
+				EcosystemAPIManager.FoliageCandidateState candidate = element instanceof CompoundTag compound
+					? EcosystemAPIManager.FoliageCandidateState.fromNbt(compound, chunkKey) : null;
 				if (candidate == null) {
 					continue;
 				}
-				putFoliageCandidate(new EcosystemAPIManager.ChunkRefKey(candidate.levelId, candidate.chunkX, candidate.chunkZ), candidate);
+				putFoliageCandidate(chunkKey, candidate);
 			}
 		}
 	}
